@@ -26,11 +26,20 @@ function cfTime() {
   return new Date().toISOString().replace("Z", "+00:00");
 }
 
-/** 注册一台新 WARP 设备并把 MASQUE 公钥挂上去。 */
-export async function registerWarp(deviceName = "cf-worker") {
+/** 注册一台新 WARP 设备并把 MASQUE 公钥挂上去。
+ *
+ * consumerMode=false 时走 Zero Trust：调用方要传一个刚从
+ * https://<team>.cloudflareaccess.com/warp 拿到的 JWT（只有 60 秒寿命），
+ * 通过 Cf-Access-Jwt-Assertion 头生效。注册成功后返回的 account.account_type
+ * 会带 "team" 字样；不是 team 的话说明 JWT 没生效或已过期，直接报错。
+ */
+export async function registerWarp(deviceName = "cf-worker", jwt = "") {
+  const headers = { ...H };
+  if (jwt) headers["Cf-Access-Jwt-Assertion"] = jwt;
+
   const reg = await fetch(`${API}/reg`, {
     method: "POST",
-    headers: H,
+    headers,
     body: JSON.stringify({
       key: randB64(32),
       install_id: "",
@@ -48,6 +57,17 @@ export async function registerWarp(deviceName = "cf-worker") {
     throw new Error(`WARP 注册失败 ${reg.status}: ${(await reg.text()).slice(0, 200)}`);
   }
   const acc = await reg.json();
+
+  // Zero Trust 注册要校验：JWT 没生效会落到 free 账户上，那种号用不了
+  // 团队边缘（162.159.197.x）。account_type 带 "team" 才算成功。
+  if (jwt) {
+    const t = (acc.account?.account_type || "").toLowerCase();
+    if (!t.includes("team")) {
+      throw new Error(
+        "JWT 没生效：注册到的是 free 账户而不是 Zero Trust。" +
+        "多半是 token 已过 60 秒有效期，回管理页重新拿一个立刻提交。");
+    }
+  }
 
   // MASQUE 用 P-256，和 WireGuard 那套密钥不通用
   const kp = await crypto.subtle.generateKey(
@@ -86,6 +106,9 @@ export async function registerWarp(deviceName = "cf-worker") {
     ipv4: up.config?.interface?.addresses?.v4 || acc.config?.interface?.addresses?.v4,
     ipv6: up.config?.interface?.addresses?.v6 || acc.config?.interface?.addresses?.v6,
     registeredAt: new Date().toISOString(),
+    // consumer=false / Zero Trust=true。config.js 据此决定是否启用团队边缘
+    zeroTrust: !!jwt,
+    accountType: acc.account?.account_type || "",
   };
 }
 

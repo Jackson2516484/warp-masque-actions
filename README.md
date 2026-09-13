@@ -162,8 +162,10 @@ Surge、Quantumult X、Karing 不行。
 
 ### 能选国家吗
 
-不能。免费 WARP 账号的出口由 Cloudflare 任播决定，你在哪就近落哪。
-要指定落地得用 WARP+ 或者 ZeroTrust，这个仓库不支持。
+纯 WARP（包括 Zero Trust）不行，出口由 Cloudflare 任播决定，你在哪就近落哪。
+要指定落地得套一层：Worker 版自带 Opera / Proton / Windscribe 落地，
+按国家/地区分组能直接选。Zero Trust 把这些落地的骨干换稳换快，但出口国家
+还是得靠落地那一跳选。见[Zero Trust 骨干](#zero-trust-骨干可选)那节。
 
 ### 跑 workflow 报 login failed
 
@@ -255,15 +257,17 @@ Shadowrocket、Stash 不认 `dialer-proxy`，用不了套娃配置——
 Actions 那条要手动点一下才跑。如果想要它自己更新、随时有个 URL 能拿到最新配置，
 用 `worker/` 这份。
 
-一份聚合订阅，导进去有两类线路可切：
+一份聚合订阅，导进去有几类线路可切：
 
 - **亚洲 / 欧洲 / 美洲线路** — 走 MASQUE 再落 Opera，能换出口国家，多一跳会慢些
 - **WARP直连** — 只走 MASQUE，出口是 Cloudflare 自己的 IP，快但选不了国家
+- **ZT团队边缘** — 配了 Zero Trust 之后出现，走 162.159.197.x 团队边缘，更稳
 - **Proton线路** — 配了 Proton 之后出现，下面按国家分组，可以直接选日本、新加坡等
 - **Windscribe线路** — 13 个地区，按地区分组。亚洲只有香港，但 Opera 那三个大区里没有
 
-套娃线路超时或某个落地挂了，切 WARP直连 顶上。这两类共用同一批 MASQUE
-接入点，直连组本来就在配置里（做 dialer-proxy 的目标），顺手暴露出来而已。
+套娃线路超时或某个落地挂了，切 WARP直连（或 ZT团队边缘）顶上。这几类共用同一批
+MASQUE 接入点，直连组本来就在配置里（做 dialer-proxy 的目标），顺手暴露出来而已。
+配了 Zero Trust 后，Proton/Windscribe 这些选国家的落地会改走团队边缘当骨干。
 
 不用定时任务。Opera 凭据 4 小时到期，Worker 在订阅被访问时才检查：
 没过期直接给缓存，过期了才重新注册。没人用就不动，不浪费。
@@ -489,16 +493,61 @@ runner 的 IP 干净。
 
 流水线也配了每月 1 号自动跑一次，对上 Windscribe 的月度重置。
 
+### Zero Trust 骨干（可选）
+
+前面那些落地（Opera/Proton/Windscribe）是**选国家**的，骨干是 consumer WARP。
+Zero Trust 是把骨干那一段换成**团队设备**：MASQUE 协议 + 团队边缘节点
+（`162.159.197.x`），实测比 `198/199` 那批免费边缘更稳，连断都少。
+免费套餐 50 个席位、不限速。
+
+订阅里会多出一个 **ZT团队边缘** 直连组，Proton/Windscribe 那些选国家的
+落地也会改走团队边缘当骨干。Opera 仍走免费边缘全集（要的是回退面广）。
+
+**关于选国家要说清楚**：Zero Trust 免费版**不能直接选出口国家**，出口仍由
+Cloudflare 任播就近落（多半是旧金山）。要选国家走的是上面 Proton /
+Windscribe / Opera 那几条落地。Zero Trust 的作用是把它们的骨干换快换稳——
+组合起来就是「快的骨干 + 能选国家」。
+
+**为什么 JWT 只有 60 秒**：Zero Trust 注册要一个 Team Token（JWT），从
+`https://<你的团队名>.cloudflareaccess.com/warp` 走完邮箱验证码登录后拿到。
+这个 token 只有 60 秒寿命，必须拿到立刻用。注册成功后存的是长期有效的设备
+凭据，不用反复粘。
+
+#### 方式一：在 Worker 管理页粘 JWT（推荐）
+
+管理页「Zero Trust 骨干」区块有个输入框，把 JWT 粘进去点「立即注册」。
+Worker 当场调 Cloudflare API 注册，校验落在 team 账户上才存，否则报错。
+全程不用 Actions、不用服务器。
+
+拿 JWT：浏览器开上面的地址，登录后在成功页面找 `meta http-equiv="refresh"`，
+`token=` 后面那串就是；或控制台跑
+`document.querySelector("meta[http-equiv='refresh']").content.split("=")[2]`。
+
+#### 方式二：Actions 流水线（留存档 / 自动推送）
+
+Actions 里选 `取 Zero Trust 凭据`，把 JWT 粘进 `jwt` 输入框跑。用 usque 注册，
+打成 blob，推到 Worker（和 Proton/Windscribe 共用 `WORKER_PUSH_URL`，末尾加
+`/zt`）。没配推送地址就只在 artifact 里留一份。
+
+两种方式产出的设备结构一样，选一种就行。设备长期有效，除非团队边缘整体连不上
+再重跑换设备。
+
+#### ZT 启用后「重注册 WARP」怎么变
+
+`重注册 WARP 设备` 那个按钮在 ZT 启用时会拒绝并提示：ZT 重注册要新的 60 秒 JWT，
+不能静默做。要先点「清除 Zero Trust」回退免费 WARP，或粘新 JWT 重新注册。
+
 ### 跑测试
 
 ```bash
 cd worker && npm test
 ```
 
-99 项，覆盖常数时间比较、token 伪造/篡改/过期、登录限速、并发初始化，
-Proton 凭据推送（令牌校验、坏数据、过期拒绝、换令牌失效），
-配置结构（分组完整性、无悬空引用、直连组成员正确），
-以及路由层的鉴权（未登录一律 404、订阅 token 校验、按需重建、cookie 安全属性）。
+180 项，覆盖常数时间比较、token 伪造/篡改/过期、登录限速、并发初始化，
+Proton/Windscribe/Zero Trust 凭据推送（令牌校验、坏数据、降额/非 team 账户拒绝、
+换令牌失效），配置结构（分组完整性、无悬空引用、直连组成员正确、ZT 团队边缘
+只在 team 设备启用、落地走团队边缘骨干），以及路由层的鉴权（未登录一律 404、
+订阅 token 校验、按需重建、cookie 安全属性）。
 
 ### 两个坑
 

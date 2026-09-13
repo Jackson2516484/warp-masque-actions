@@ -69,9 +69,13 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
     dns: [1.1.1.1, 2606:4700:4700::1111]`;
 }
 
-/** 生成全部 MASQUE 接入点。两种配置都用这批。 */
+/** 生成全部 MASQUE 接入点。两种配置都用这批。
+ *
+ * zeroTrust 为真时（设备是 Zero Trust 注册的）会额外吐一批团队边缘
+ * 节点（162.159.197.x + zt-masque SNI），单独收在 teamEntries 里。
+ * 团队边缘免费号连不上，所以只在 ZT 设备启用时才放出来。 */
 function buildEntries(warp) {
-  const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6 } = warp;
+  const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = warp;
   const entries = [], proxies = [];
   // v4Entries 单独留一份：做 dialer-proxy 目标时只能用 IPv4，
   // 否则纯 IPv4 的机器上会直接 "network is unreachable"。
@@ -88,7 +92,20 @@ function buildEntries(warp) {
   v4Entries.push("官方域名");   // 官方域名节点本身连的是 IPv4
   proxies.push(masqueNode("官方域名", SNI_NODE[0], SNI_NODE[1],
                           priv, pub, v4, v6, OFFICIAL_SNI));
-  return { entries, proxies, v4Entries };
+
+  // 团队边缘：只在 Zero Trust 设备启用时才有。这批是 ZT 专属，免费号
+  // 喂进去 login 失败。节点名带 "ZT-" 前缀好让客户端一眼分清。
+  const teamEntries = [], teamProxies = [];
+  if (zeroTrust) {
+    for (const ip of TEAM_V4) {
+      for (const port of TEAM_PORTS) {
+        const n = `ZT-${entryName(ip, port)}`;
+        teamEntries.push(n);
+        teamProxies.push(masqueNode(n, ip, port, priv, pub, v4, v6, ZT_SNI));
+      }
+    }
+  }
+  return { entries, proxies, v4Entries, teamEntries, teamProxies };
 }
 
 // 规则集只盖到 OpenAI / Claude / Gemini / Copilot，其他家没人维护。
@@ -315,9 +332,22 @@ ${p(picks)}
 }
 
 export function buildConfig(warp, opera, proton, wind) {
-  const { entries, proxies, v4Entries } = buildEntries(warp);
+  const { entries, proxies, v4Entries, teamEntries, teamProxies } = buildEntries(warp);
+  const zt = !!warp.zeroTrust && teamEntries.length > 0;
 
-  // 笛卡尔积：任一接入点或任一落地失效，其他组合仍可用
+  // Zero Trust 启用时，团队边缘节点也要进 proxies 池。
+  // 放在免费边缘后面，客户端按组用，互不影响。
+  if (zt) proxies.push(...teamProxies);
+
+  // 嵌套落地（选国家那条）走哪个接入点池：Zero Trust 时优先走团队边缘
+  // （更稳），没有才用免费 v4。WireGuard/HTTPS 的 UDP 都得经这个接入点
+  // 发出去，分到 IPv6 会让纯 IPv4 的机器 network is unreachable。
+  const dialerPool = zt ? teamEntries : v4Entries;
+  const dialerFallback = v4Entries;   // 团队边缘全挂时兜底，避免 0 个可用
+
+  // 笛卡尔积：任一接入点或任一落地失效，其他组合仍可用。
+  // Opera 走的是免费边缘全集（要的是尽可能多的回退组合），不切团队边缘：
+  // 团队边缘只有 4 个，做笛卡尔积回退面太窄；它另开一个直连组走稳定线路。
   const byLoc = {};
   for (const land of opera.landings) {
     for (const ent of entries) {
@@ -333,14 +363,13 @@ export function buildConfig(warp, opera, proton, wind) {
 
   // Proton 落地。28 台 x 41 接入点会爆到上千节点，没必要，
   // 每台轮着分一个接入点即可，接入点挂了还有其他 Proton 节点顶。
-  //
-  // 只从 v4Entries 里选：WireGuard 的 UDP 要经这个接入点发出去，
-  // 分到 IPv6 接入点的话，没有 IPv6 的机器上会全部 network is unreachable。
+  // Zero Trust 启用时优先分团队边缘（更稳），团队边缘全没就回退免费 v4。
   let protonNames = [];
   const protonByCC = {};   // 国家 -> 该国节点名，用来按国家分组
   if (proton && proton.servers && proton.servers.length) {
     proton.servers.forEach((srv, i) => {
-      const ent = v4Entries[i % v4Entries.length];
+      const ent = dialerPool[i % dialerPool.length] ||
+                  dialerFallback[i % dialerFallback.length];
       protonNames.push(srv.name);
       // 节点名形如「日本1」，去掉尾号就是国家名
       const cc = srv.name.replace(/\d+$/, "");
@@ -360,12 +389,13 @@ export function buildConfig(warp, opera, proton, wind) {
 
   // Windscribe 落地。和 Opera 同构（HTTPS 代理 + Basic），
   // 但免费额度只有 2GB/月，做笛卡尔积没意义 —— 每台轮一个接入点就够。
-  // 只从 v4Entries 选，理由同 Proton：纯 IPv4 的机器上 v6 接入点不可达。
+  // 同样优先团队边缘（Zero Trust 启用时），理由同 Proton。
   const windNames = [];
   const windByLoc = {};
   if (wind && wind.servers && wind.servers.length) {
     wind.servers.forEach((srv, i) => {
-      const ent = v4Entries[i % v4Entries.length];
+      const ent = dialerPool[i % dialerPool.length] ||
+                  dialerFallback[i % dialerFallback.length];
       const name = `WS-${srv.tag}`;
       windNames.push(name);
       (windByLoc[srv.loc] = windByLoc[srv.loc] || []).push(name);
@@ -402,7 +432,9 @@ ${q(names)}`).join("\n\n");
     proxies:
 ${q(names)}`).join("\n\n");
 
-  const picks = [...locNames, "WARP直连"];
+  const picks = [...locNames, zt ? "ZT团队边缘" : "WARP直连"];
+  // Zero Trust 启用时多放一个 WARP直连（免费边缘）作为回退直连选项
+  if (zt) picks.push("WARP直连");
   if (protonNames.length) picks.push("Proton线路", ...protonCCNames);
   if (windNames.length) picks.push("Windscribe线路", ...windLocNames);
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}线路
@@ -414,6 +446,19 @@ ${q(names)}`).join("\n\n");
     proxies:
 ${q(tags)}`).join("\n\n");
 
+  // ZT 团队边缘直连组。只有 Zero Trust 设备才出现：197.x 这批比 198/199
+  // 更稳，是免费号连不上的。开了 lazy，不会一进去就把几个全测一遍。
+  const ztGroupDef = zt ? `
+  - name: ZT团队边缘
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    lazy: true
+    proxies:
+${q(teamEntries)}
+` : "";
+
   const { prov, rules } = buildRules();
 
   const yaml = `# Opera VPN over Cloudflare WARP (MASQUE)
@@ -423,11 +468,13 @@ ${q(tags)}`).join("\n\n");
 #
 #   亚洲/欧洲/美洲线路  本机 -> MASQUE -> Opera 落地 -> 目标（能换出口国家）
 #   WARP直连            本机 -> MASQUE -> 目标（出口是 CF 自己的 IP，快）
+${zt ? `#   ZT团队边缘         本机 -> MASQUE(团队边缘 197.x) -> 目标（更稳，仅 Zero Trust 可用）` : ""}
 #
 # 节点名 "欧洲1@198.1-443" = 欧洲第 1 个落地，经 162.159.198.1:443 接入。
+# ZT- 开头的是 Zero Trust 团队边缘节点（162.159.197.x），免费号连不上。
 #
 # 接入点 ${entries.length} 个 x 落地 ${opera.landings.length} 个 = 组合 ${combos} 个，
-# 外加 ${entries.length} 个直连接入点${protonNames.length ? ` 和 ${protonNames.length} 个 Proton 落地` : ""}${windNames.length ? ` 和 ${windNames.length} 个 Windscribe 落地` : ""}。
+# 外加 ${entries.length} 个直连接入点${zt ? ` 和 ${teamEntries.length} 个 ZT 团队边缘` : ""}${protonNames.length ? ` 和 ${protonNames.length} 个 Proton 落地` : ""}${windNames.length ? ` 和 ${windNames.length} 个 Windscribe 落地` : ""}。
 # 任一环失效都有替代路径。
 #
 # 需要 mihomo Alpha 分支：稳定版没有 masque outbound，也不认 dialer-proxy。
@@ -464,7 +511,7 @@ ${p(picks)}
 ${p(picks)}
 
 ${locDefs}
-
+${ztGroupDef}
   - name: WARP直连
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -521,5 +568,6 @@ ${rules}
 `;
 
   return { yaml, entries: entries.length, landings: opera.landings.length,
-           combos, proton: protonNames.length, wind: windNames.length };
+           combos, proton: protonNames.length, wind: windNames.length,
+           zeroTrust: zt, teamEdges: teamEntries.length };
 }

@@ -166,5 +166,73 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("AI服务 能选 WARP直连", ai.includes("WARP直连"));
 }
 
+// Zero Trust 骨干：团队边缘 + 落地走团队边缘
+{
+  const ztWarp = { ...warp, zeroTrust: true, accountType: "team" };
+  const r = buildConfig(ztWarp, opera);
+  const y = r.yaml;
+  const gs = [...y.matchAll(/^  - name: (.+)$/gm)].map((m) => m[1]);
+  const entryNames = [...y.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
+
+  t("ZT 标记为启用", r.zeroTrust === true);
+  t(`团队边缘 ${r.teamEdges} 个 (2 IP x 2 端口)`, r.teamEdges === 4);
+  t("有 ZT团队边缘 组", gs.includes("ZT团队边缘"));
+
+  // 团队边缘节点必须是 197.x + 带 ZT SNI
+  const ztEntries = entryNames.filter((n) => n.startsWith("ZT-"));
+  t(`ZT- 前缀节点 ${ztEntries.length} 个`, ztEntries.length === 4);
+  const ztNodeBlock = y.split("  - name: ZT-197.1-443")[1].split("\n  - name:")[0];
+  t("团队边缘走 197.x", ztNodeBlock.includes("162.159.197"));
+  t("团队边缘用 zt-masque SNI", ztNodeBlock.includes("zt-masque.cloudflareclient.com"));
+
+  // 节点选择里要有 ZT团队边缘，WARP直连 也还在（作回退）
+  const sel = y.split("  - name: 🚀 节点选择")[1].split("\n  - name:")[0];
+  t("节点选择含 ZT团队边缘", sel.includes("ZT团队边缘"));
+  t("节点选择仍含 WARP直连", sel.includes("WARP直连"));
+
+  // ZT团队边缘 组成员都是 ZT- 节点，不能混进免费边缘
+  const ztGroup = y.split("  - name: ZT团队边缘")[1].split("\n  - name:")[0];
+  const ztMembers = [...ztGroup.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`ZT组 ${ztMembers.length} 个成员`, ztMembers.length === 4);
+  t("ZT组成员都是 ZT- 前缀", ztMembers.every((m) => m.startsWith("ZT-")));
+  t("ZT组成员都在 proxies 里", ztMembers.every((m) => entryNames.includes(m)));
+
+  // Proton/Windscribe 落地应该走团队边缘（ZT- 前缀接入点）
+  const proton = {
+    privateKey: "PK", expiresAt: Math.floor(Date.now()/1000)+604800,
+    servers: [
+      { name: "日本1", cc: "JP", ip: "1.1.1.1", port: 51820, pub: "A" },
+      { name: "美国1", cc: "US", ip: "2.2.2.1", port: 51820, pub: "C" },
+    ],
+  };
+  const rz = buildConfig(ztWarp, opera, proton);
+  const dps = [...rz.yaml.matchAll(/type: wireguard[\s\S]*?dialer-proxy: (\S+)/g)].map((m) => m[1]);
+  t(`Proton 落地 ${dps.length} 个全走团队边缘`,
+    dps.length === 2 && dps.every((d) => d.startsWith("ZT-")));
+
+  // 悬空引用（含 ZT + Proton 分组）。groups 要从同一份配置取，不能拿
+  // 没 Proton 那份的 gs 来对，否则 Proton线路/Proton-日本 这些会被误判悬空。
+  // 所有 `  - name:` 行都要算进 defined：组定义 + 块式代理定义（Proton 的
+  // `name: "日本1"` 带引号，refs 里成员行去掉引号，两边要统一才能对上）。
+  const gs2 = [...rz.yaml.matchAll(/^  - name: (.+)$/gm)]
+    .map((m) => m[1].replace(/^"(.+)"$/, "$1"));
+  const gsec = rz.yaml.slice(rz.yaml.indexOf("proxy-groups:"), rz.yaml.indexOf("rule-providers:"));
+  const refs = [...gsec.matchAll(/^      - "?([^"\n]+)"?$/gm)].map((m) => m[1].trim());
+  const names = [...rz.yaml.matchAll(/^  - \{name: "([^"]+)"/gm)].map((m) => m[1]);
+  const ents = [...rz.yaml.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
+  const def = new Set([...gs2, ...names, ...ents, "DIRECT", "REJECT"]);
+  const dang = [...new Set(refs.filter((r) => !def.has(r)))];
+  t(`ZT 配置无悬空引用${dang.length ? " (" + dang.slice(0, 3) + ")" : ""}`, dang.length === 0);
+
+  // consumer WARP（不传 zeroTrust）绝不能冒出团队边缘。
+  // 只看真正的节点定义（server: 162.159.197），不看注释里的说明文字。
+  const consumer = buildConfig(warp, opera);
+  t("免费 WARP 不该有 ZT团队边缘 组", !consumer.yaml.includes("ZT团队边缘"));
+  t("免费 WARP 不该有 197.x 节点定义",
+    !/server: 162\.159\.197/.test(consumer.yaml));
+  t("免费 WARP 标记 ZT 关", consumer.zeroTrust === false && consumer.teamEdges === 0);
+}
+
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);
+

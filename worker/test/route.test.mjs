@@ -86,7 +86,15 @@ t("对密码登录 200",
   (await worker.fetch(post("/login", { password: PW }), env)).status === 200);
 
 // ---- 订阅 ----
+// 放一份"还没过期"的配置 + state，访问订阅应直接返回缓存、不触发重建。
+// 不设 state 的话 ensureConfig 会判定过期去 rebuild，那要联网注册 WARP/Opera，
+// 测试就依赖真实 API 了——这条测的是订阅投递，不是重建。
 kv.set("config:yaml", "# fake\nproxies: []");
+kv.set("state:meta", JSON.stringify({
+  updatedAt: new Date().toISOString(),
+  expiresAt: new Date(Date.now() + 3 * 3600 * 1000).toISOString(),
+  stats: {}, warp: {},
+}));
 const home = await (await worker.fetch(req("/", { headers: auth }), env)).text();
 const tok = (home.match(/token=([\w.\-]+)/) || [])[1];
 t("状态页给出带 token 的订阅链接", !!tok);
@@ -328,6 +336,146 @@ t("新密码能登上",
   await worker.fetch(post("/api/wind/clear", {}, a6), env);
   t("能清除 Windscribe 账号", !kv.get("wind:account"));
   t("清除 wind 不动 Proton", !!kv.get("proton:cred"));
+}
+
+// ---- Zero Trust 注册 ----
+// JWT 只有 60 秒寿命，注册必须当场用掉。这里 mock 掉 CF API，
+// 验证：JWT 走 Cf-Access-Jwt-Assertion 头、非 team 账户被拒、设备落 KV、
+// 清除可用、要登录。
+{
+  reset();
+  await worker.fetch(post("/api/setup", { password: PW, confirm: PW }), env);
+  const ck = (await worker.fetch(post("/login", { password: PW }), env))
+    .headers.get("set-cookie").split(";")[0];
+  const az = { cookie: ck };
+
+  // 未登录 enroll 直接 404（不泄露路径存在）
+  t("未登录 enroll 是 404",
+    (await worker.fetch(post("/api/zt/enroll", { jwt: "x" }), env)).status === 404);
+  t("未登录 clear 是 404",
+    (await worker.fetch(post("/api/zt/clear", {}), env)).status === 404);
+
+  // 空JWT / 太短的 JWT 被拒
+  t("空 JWT 被拒",
+    (await worker.fetch(post("/api/zt/enroll", { jwt: "" }, az), env)).status === 400);
+  t("太短 JWT 被拒",
+    (await worker.fetch(post("/api/zt/enroll", { jwt: "abc" }, az), env)).status === 400);
+
+  // mock CF API。POST /reg 看 JWT 值决定回 team 还是 free：
+  // 「好 JWT」回 team（注册成功），别的 JWT 回 free（模拟过期/未生效，
+  // registerWarp 必须拒掉，不能把降级号当 ZT 用）。
+  // PATCH /reg/<id> 回 MASQUE enroll 结果。别的地址（Opera 等）一律 500，
+  // rebuild 会失败但设备该已写入 KV —— 跟 Proton 推送那条测试一个思路。
+  const GOOD_JWT = "fake.jwt.team.token.value.long.enough.to.pass.length.check";
+  const realFetch = globalThis.fetch;
+  let sawJwtHeader = "";
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url), m = init.method || "GET";
+    if (u.includes("api.cloudflareclient.com") && u.endsWith("/reg") && m === "POST") {
+      sawJwtHeader = init.headers?.["Cf-Access-Jwt-Assertion"] || "";
+      const isTeam = sawJwtHeader === GOOD_JWT;
+      return new Response(JSON.stringify({
+        id: "dev-abc", token: "tok-abc",
+        account: { account_type: isTeam ? "team" : "free" },
+        config: { interface: { addresses: { v4: "172.16.0.2", v6: "2606:4700:110::2" } } },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (u.includes("api.cloudflareclient.com") && u.includes("/reg/dev-abc") && m === "PATCH") {
+      return new Response(JSON.stringify({
+        config: { peers: [{ public_key: "PEERPUBKEY" }],
+                  interface: { addresses: { v4: "172.16.0.2", v6: "2606:4700:110::2" } } },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("no mock", { status: 500 });
+  };
+
+  // JWT 让 CF 回 free 账户 → 必须被拒（不能把降级号当 ZT 用）
+  const bad = await worker.fetch(post("/api/zt/enroll",
+    { jwt: "not.a.real.jwt.but.long.enough.to.pass.length.check" }, az), env);
+  t("落到 free 账户被拒", bad.status === 500);
+  t("错误提示提到 free",
+    (await bad.json()).error.includes("free"));
+  t("没落 KV", !kv.get("zt:device"));
+
+  // 正常 team 注册。JWT 走头生效，设备落 KV。
+  // rebuild 会因 Opera 没 mock 而失败，但 enroll 本身该成功。
+  const good = await worker.fetch(post("/api/zt/enroll",
+    { jwt: GOOD_JWT }, az), env);
+  const gj = await good.json();
+  t("team 注册返回 ok", good.status === 200 && gj.ok);
+  t("JWT 走了 Cf-Access-Jwt-Assertion 头", sawJwtHeader === GOOD_JWT);
+  t("ZT 设备已落 KV", !!kv.get("zt:device"));
+  const dev = JSON.parse(kv.get("zt:device"));
+  t("设备标记 zeroTrust=true", dev.zeroTrust === true);
+  t("设备 accountType 是 team", dev.accountType === "team");
+  t("设备有 deviceId", dev.deviceId === "dev-abc");
+  t("设备有 MASQUE 私钥", !!dev.privateKey);
+  t("设备有内网地址", dev.ipv4 === "172.16.0.2");
+
+  globalThis.fetch = realFetch;
+
+  // 清除
+  const clr = await worker.fetch(post("/api/zt/clear", {}, az), env);
+  t("清除 ZT 返回 ok", clr.status === 200 && (await clr.json()).ok);
+  t("清除后 KV 无 ZT 设备", !kv.get("zt:device"));
+
+  // reset-warp 在 ZT 启用时应引导用户先清除（不能静默重注册 ZT）
+  // 重新塞回一个 ZT 设备测这条
+  kv.set("zt:device", JSON.stringify({ ...dev }));
+  const rw = await worker.fetch(post("/api/reset-warp", {}, az), env);
+  const rwj = await rw.json();
+  t("ZT 启用时 reset-warp 拒绝并引导",
+    !rwj.ok && rwj.error.includes("Zero Trust"));
+}
+
+// ---- Zero Trust 设备由流水线推送 ----
+// 和 Proton/Windscribe 共用推送地址，末尾加 /zt。
+{
+  reset();
+  await worker.fetch(post("/api/setup", { password: PW, confirm: PW }), env);
+  const ck = (await worker.fetch(post("/login", { password: PW }), env))
+    .headers.get("set-cookie").split(";")[0];
+  const az2 = { cookie: ck };
+  const tk = (await (await worker.fetch(post("/api/proton/token", {}, az2), env)).json()).token;
+  const raw = (p, body) => new Request(`https://x.dev${p}`, {
+    method: "POST", headers: { "cf-connecting-ip": "9.9.9.9" }, body });
+
+  const blob = btoa(JSON.stringify({
+    v: 1, deviceId: "dev-from-actions",
+    privateKey: "SEC1KEY", peerPublicKey: "PEERPUB",
+    ipv4: "172.16.0.9", ipv6: "2606:4700:110::9",
+    zeroTrust: true, accountType: "team",
+    registeredAt: new Date().toISOString(),
+  }));
+
+  t("错令牌推 zt 是 404",
+    (await worker.fetch(raw("/push/wrong/zt", blob), env)).status === 404);
+  t("坏 base64 被拒",
+    (await worker.fetch(raw(`/push/${tk}/zt`, "not-base64!!"), env)).status === 400);
+  t("缺 privateKey 被拒",
+    (await worker.fetch(raw(`/push/${tk}/zt`,
+      btoa(JSON.stringify({ v: 1, ipv4: "1.1.1.1" }))), env)).status === 400);
+  t("错版本被拒",
+    (await worker.fetch(raw(`/push/${tk}/zt`,
+      btoa(JSON.stringify({ v: 2, privateKey: "k", ipv4: "1.1.1.1" }))), env)).status === 400);
+
+  // 正常推送（rebuild 联网失败不影响设备写入）
+  const okr = await worker.fetch(raw(`/push/${tk}/zt`, blob), env);
+  t("正常 ZT 推送被接受", okr.status === 200);
+  t("ZT 设备已落 KV", !!kv.get("zt:device"));
+  const d = JSON.parse(kv.get("zt:device"));
+  t("设备 deviceId 正确", d.deviceId === "dev-from-actions");
+  t("强制标记 zeroTrust", d.zeroTrust === true);
+  t("推过来的设备不影响 Proton",
+    !kv.get("proton:cred") && !kv.get("wind:account"));
+
+  // 同一令牌不带后缀走 Proton，/zt 走 ZT，互不干扰
+  const pblob = btoa(JSON.stringify({
+    v: 1, privateKey: "K", expiresAt: Math.floor(Date.now()/1000)+604800,
+    servers: [{ name: "JP1", ip: "1.1.1.1", port: 51820, pub: "P" }] }));
+  await worker.fetch(raw(`/push/${tk}`, pblob), env);
+  t("同一令牌不带后缀走 Proton", !!kv.get("proton:cred"));
+  t("两种凭据互不覆盖", !!kv.get("zt:device") && !!kv.get("proton:cred"));
 }
 
 console.log(`\n通过 ${pass} 失败 ${fail}`);

@@ -197,7 +197,7 @@ async function go(e){
 </body></html>`;
 }
 
-export function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage) {
+export function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage, ztDevice) {
   const s = state || {};
   const warp = s.warp || {};
   const stat = s.stats || {};
@@ -312,12 +312,13 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         <button class="gh" onclick="location.href=document.getElementById('u').value">下载</button>
       </div>
       <div class="note">
-        一份聚合，导进去有两类线路可切：<br>
+        一份聚合，导进去有几类线路可切：<br>
         <b>亚洲/欧洲/美洲线路</b> — 走 MASQUE 再落 Opera，能换出口国家，但多一跳会慢些。<br>
         <b>WARP直连</b> — 只走 MASQUE，出口是 Cloudflare 自己的 IP，快但选不了国家。<br>
+        ${s.zeroTrust ? '<b>ZT团队边缘</b> — 走 197.x 团队边缘，更稳（Zero Trust 启用后出现）。<br>' : ""}
         <b>Proton线路</b> — MASQUE 打底 + Proton WireGuard 落地，10 个国家（配置后出现）。<br>
         <b>Windscribe线路</b> — MASQUE 打底 + Windscribe 落地，13 个地区，有香港（配置后出现）。<br>
-        套娃线路超时或落地挂了，切 WARP直连顶上。
+        套娃线路超时或落地挂了，切${s.zeroTrust ? "ZT团队边缘或" : ""}WARP直连顶上。
       </div>
       <div id="msg"></div>
     </div>
@@ -328,13 +329,14 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         <div class="cell"><div class="n">${stat.combos ?? "—"}</div><div class="l">组合节点</div></div>
         <div class="cell"><div class="n">${stat.entries ?? "—"}</div><div class="l">MASQUE 接入点</div></div>
         <div class="cell"><div class="n">${stat.landings ?? "—"}</div><div class="l">Opera 落地</div></div>
-        <div class="cell"><div class="n">${stat.entries ?? "—"}</div><div class="l">WARP 直连</div></div>
+        <div class="cell"><div class="n">${s.zeroTrust ? (stat.teamEdges || "—") : (stat.entries ?? "—")}</div><div class="l">${s.zeroTrust ? "ZT 团队边缘" : "WARP 直连"}</div></div>
         <div class="cell"><div class="n">${stat.proton || "—"}</div><div class="l">Proton 落地</div></div>
         <div class="cell"><div class="n">${stat.wind || "—"}</div><div class="l">Windscribe 落地</div></div>
       </div>
       <div class="note">
         每个落地和每个接入点都组合一遍，任一环失效都还有别的路走。<br>
-        节点名 <b>欧洲1@198.1-443</b> = 欧洲第 1 个落地，经 162.159.198.1:443 接入。
+        节点名 <b>欧洲1@198.1-443</b> = 欧洲第 1 个落地，经 162.159.198.1:443 接入。<br>
+        <b>ZT-</b> 开头的是 Zero Trust 团队边缘（162.159.197.x），免费号连不上。
       </div>
     </div>
 
@@ -346,6 +348,8 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
       ${row("到期时间", fmt(exp))}
       ${row("密码更新于", cred && cred.updatedAt ? fmt(new Date(cred.updatedAt)) : "—")}
       ${row("WARP 设备", warp.deviceId ? warp.deviceId.slice(0, 8) + "…" : "—")}
+      ${row("设备模式", warp.zeroTrust ? "Zero Trust（团队边缘）" : "免费 WARP",
+             warp.zeroTrust ? "ok" : "")}
       ${row("WARP 注册于", warp.registeredAt ? fmt(new Date(warp.registeredAt)) : "—")}
       ${row("内网地址", warp.ipv4 || "—")}
     </div>
@@ -360,7 +364,49 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         Opera 凭据 4 小时到期。<b>不用定时任务</b>——订阅被访问时才检查，
         没过期直接给缓存，过期了才重新注册。<br>
         想提前换一份就点刷新。<br>
-        WARP 设备信息存在 KV 里复用，<b>一般不用重注册</b>，除非 MASQUE 整体连不上。
+        WARP 设备信息存在 KV 里复用，<b>一般不用重注册</b>，除非 MASQUE 整体连不上。<br>
+        Zero Trust 启用时重注册会提示先清除 ZT 再重新粘 JWT（JWT 只有 60 秒寿命）。
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">Zero Trust 骨干</div>
+      ${ztDevice ? `
+      <div class="row"><span class="k">状态</span><span class="v ok">已启用 ${
+        ztDevice.accountType || "team"}</span></div>
+      <div class="row"><span class="k">设备</span><span class="v">${
+        ztDevice.deviceId ? ztDevice.deviceId.slice(0, 8) + "…" : "—"}</span></div>
+      <div class="row"><span class="k">注册于</span><span class="v">${
+        ztDevice.registeredAt ? fmt(new Date(ztDevice.registeredAt)) : "—"}</span></div>
+      <div class="row"><span class="k">骨干节点</span><span class="v">${
+        stat.teamEdges || 0} 个团队边缘（162.159.197.x）</span></div>
+      ` : `
+      <div class="row"><span class="k">状态</span><span class="v warn">未启用（用免费 WARP）</span></div>
+      `}
+      <div class="note" style="margin-bottom:10px">
+        Zero Trust 把 WARP 注册成团队设备，用上 MASQUE 协议和<b>团队边缘
+        162.159.197.x</b>——实测比 198/199 那批免费边缘更稳，连断都少。
+        免费套餐 50 个席位，不限速。<br>
+        <b>关于选国家要说清楚</b>：Zero Trust 免费版<b>不能</b>直接选出口国家，
+        出口仍由 Cloudflare 任播就近落（多半是旧金山）。要选国家走的是下面
+        Proton / Windscribe / Opera 那几条落地，Zero Trust 是把它们的骨干
+        换快换稳。组合起来就是「快的骨干 + 能选国家」。
+      </div>
+      <div class="f" style="display:flex;flex-direction:column;gap:8px">
+        <input id="zt" placeholder="粘 Team Token (JWT) —— 只有 60 秒寿命，拿到立刻粘"
+               spellcheck="false" autocomplete="off">
+        <div class="sub" style="margin-top:0">
+          <button onclick="enrollZt()">立即注册</button>
+          ${ztDevice ? '<button class="gh" onclick="go(\'/api/zt/clear\')">清除 ZT 回退免费</button>' : ""}
+        </div>
+      </div>
+      <div class="note">
+        <b>怎么拿 JWT</b>：浏览器开 <code>https://&lt;你的团队名&gt;.cloudflareaccess.com/warp</code>，
+        完成邮箱验证码登录，在成功页面的源码里找 <code>meta http-equiv="refresh"</code>，
+        <code>token=</code> 后面那串就是。或者控制台跑
+        <code>document.querySelector("meta[http-equiv='refresh']").content.split("=")[2]</code>。<br>
+        拿到<b>立刻</b>粘进来点注册，超过 60 秒就失效，会报「注册到的是 free 账户」。
+        注册成功后设备长期有效，不用反复粘。
       </div>
     </div>
 
@@ -512,6 +558,13 @@ async function go(p){
     if(j.ok){say(j.msg+'，即将刷新','var(--mint)');setTimeout(()=>location.reload(),1200);}
     else{say('失败: '+j.error,'var(--red)');bs.forEach(b=>b.disabled=false);}
   }catch(e){say('失败: '+e.message,'var(--red)');bs.forEach(b=>b.disabled=false);}
+}
+async function enrollZt(){
+  const v=document.getElementById('zt').value.trim();
+  if(!v){say('把 JWT 粘进来','var(--red)');return;}
+  if(v.length<40){say('这串太短，不像 JWT','var(--red)');return;}
+  // JWT 寿命 60 秒，注册要趁早
+  post('/api/zt/enroll',{jwt:v},'注册中');
 }
 </script>
 </body></html>`;

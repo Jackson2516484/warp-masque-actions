@@ -1,0 +1,109 @@
+name: 取 Zero Trust 凭据
+
+# 把 WARP 注册成 Zero Trust(团队)设备，拿 MASQUE 配置，推给 Worker。
+#
+# 跟 Proton/Windscribe 共用同一个推送地址（WORKER_PUSH_URL），末尾加 /zt。
+#
+# 为什么放 Actions 而不是 Worker：
+#   Zero Trust 的 Team Token(JWT)只有 60 秒寿命，必须拿到立刻用。
+#   在 Actions 里跑可以立刻用，推给 Worker 的是长期有效的设备凭据。
+#   Worker 那边也能直接粘 JWT 注册（管理页的 Zero Trust 区块），这条
+#   是给喜欢走流水线、或者想留个 artifact 存档的人用的。
+
+on:
+  workflow_dispatch:
+    inputs:
+      jwt:
+        description: Team Token (JWT) —— 60 秒寿命，拿到立刻跑
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 下载 usque
+        run: |
+          set -euo pipefail
+          VER=$(curl -sL https://api.github.com/repos/Diniboy1123/usque/releases/latest \
+                | jq -r '.tag_name' | sed 's/^v//')
+          echo "usque 版本 $VER"
+          curl -sL -o usque.zip \
+            "https://github.com/Diniboy1123/usque/releases/download/v${VER}/usque_${VER}_linux_amd64.zip"
+          unzip -oq usque.zip
+          chmod +x usque
+
+      - name: 用 Team Token 注册设备
+        env:
+          JWT: ${{ inputs.jwt }}
+        run: |
+          set -euo pipefail
+          # -a 自动 enroll MASQUE 公钥；--jwt 走 Zero Trust 团队身份
+          # Zero Trust 用 zt-masque 这个 SNI（usque 默认就带）
+          ./usque register -a -n "gh-actions-zt" --jwt "$JWT"
+          test -s config.json
+          # 校验注册到的是 team 账户，不是 free。license 为空是 Zero Trust 的正常表现
+          python3 - <<'PY'
+          import json, sys
+          c = json.load(open("config.json"))
+          print("endpoint_v4 =", c.get("endpoint_v4"))
+          print("内网地址 =", c.get("ipv4"), "/", c.get("ipv6"))
+          # Zero Trust 不用 license，字段为空是正常的
+          lic = c.get("license", "")
+          print("license =", lic or "(空，Zero Trust 正常)")
+          PY
+
+      - name: 打包成 Worker 能消费的 blob
+        run: python3 scripts/gen_zerotrust.py config.json dist
+
+      - name: 推送到 Worker
+        env:
+          URL: ${{ secrets.WORKER_PUSH_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${URL:-}" ]; then
+            echo "没配 WORKER_PUSH_URL，跳过推送。凭据在 artifact 里。"
+            exit 0
+          fi
+          # 和 Proton/Windscribe 共用一个推送地址，末尾加 /zt 区分
+          CODE=$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST "${URL%/}/zt" \
+            --data-binary @dist/zt-blob.txt)
+          echo "HTTP $CODE"
+          cat /tmp/resp.json; echo
+          [ "$CODE" = "200" ] || { echo "推送失败"; exit 1; }
+
+      - name: 摘要
+        if: always()
+        run: |
+          {
+            echo '## Zero Trust 凭据'
+            echo
+            if [ -s dist/zt-blob.txt ]; then
+              if [ -n "${{ secrets.WORKER_PUSH_URL }}" ]; then
+                echo '已自动推送到 Worker，订阅里会出现 ZT 团队边缘线路。'
+              else
+                echo '没配推送地址。配好 `WORKER_PUSH_URL` 重跑即可推送，'
+                echo '或者把 blob 当存档留着。'
+                echo
+                echo '另一种更简单的方式：不用跑这条流水线，直接到 Worker 管理页'
+                echo '的 Zero Trust 区块把 Team Token(JWT) 粘进去，Worker 自己注册。'
+              fi
+              echo
+              echo '设备长期有效，不用反复跑。除非团队边缘整体连不上再重跑换设备。'
+            else
+              echo '生成失败，看上面的日志。多半是 JWT 已过 60 秒有效期。'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 artifact
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: zerotrust-blob
+          path: dist/zt-blob.txt
+          retention-days: 7
+          if-no-files-found: error

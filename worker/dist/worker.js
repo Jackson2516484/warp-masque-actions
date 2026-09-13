@@ -21,10 +21,12 @@ function randHex(n) {
 function cfTime() {
   return (/* @__PURE__ */ new Date()).toISOString().replace("Z", "+00:00");
 }
-async function registerWarp(deviceName = "cf-worker") {
+async function registerWarp(deviceName = "cf-worker", jwt = "") {
+  const headers = { ...H };
+  if (jwt) headers["Cf-Access-Jwt-Assertion"] = jwt;
   const reg = await fetch(`${API}/reg`, {
     method: "POST",
-    headers: H,
+    headers,
     body: JSON.stringify({
       key: randB64(32),
       install_id: "",
@@ -42,6 +44,14 @@ async function registerWarp(deviceName = "cf-worker") {
     throw new Error(`WARP \u6CE8\u518C\u5931\u8D25 ${reg.status}: ${(await reg.text()).slice(0, 200)}`);
   }
   const acc = await reg.json();
+  if (jwt) {
+    const t = (acc.account?.account_type || "").toLowerCase();
+    if (!t.includes("team")) {
+      throw new Error(
+        "JWT \u6CA1\u751F\u6548\uFF1A\u6CE8\u518C\u5230\u7684\u662F free \u8D26\u6237\u800C\u4E0D\u662F Zero Trust\u3002\u591A\u534A\u662F token \u5DF2\u8FC7 60 \u79D2\u6709\u6548\u671F\uFF0C\u56DE\u7BA1\u7406\u9875\u91CD\u65B0\u62FF\u4E00\u4E2A\u7ACB\u523B\u63D0\u4EA4\u3002"
+      );
+    }
+  }
   const kp = await crypto.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" },
     true,
@@ -73,7 +83,10 @@ async function registerWarp(deviceName = "cf-worker") {
     peerPublicKey: peerPub,
     ipv4: up.config?.interface?.addresses?.v4 || acc.config?.interface?.addresses?.v4,
     ipv6: up.config?.interface?.addresses?.v6 || acc.config?.interface?.addresses?.v6,
-    registeredAt: (/* @__PURE__ */ new Date()).toISOString()
+    registeredAt: (/* @__PURE__ */ new Date()).toISOString(),
+    // consumer=false / Zero Trust=true。config.js 据此决定是否启用团队边缘
+    zeroTrust: !!jwt,
+    accountType: acc.account?.account_type || ""
   };
 }
 function pkcs8ToSec1(b64pkcs8) {
@@ -431,7 +444,7 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
     dns: [1.1.1.1, 2606:4700:4700::1111]`;
 }
 function buildEntries(warp) {
-  const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6 } = warp;
+  const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = warp;
   const entries = [], proxies = [];
   const v4Entries = [];
   for (const ip of [...V4, ...V6]) {
@@ -454,7 +467,17 @@ function buildEntries(warp) {
     v6,
     OFFICIAL_SNI
   ));
-  return { entries, proxies, v4Entries };
+  const teamEntries = [], teamProxies = [];
+  if (zeroTrust) {
+    for (const ip of TEAM_V4) {
+      for (const port of TEAM_PORTS) {
+        const n = `ZT-${entryName(ip, port)}`;
+        teamEntries.push(n);
+        teamProxies.push(masqueNode(n, ip, port, priv, pub, v4, v6, ZT_SNI));
+      }
+    }
+  }
+  return { entries, proxies, v4Entries, teamEntries, teamProxies };
 }
 var AI_DOMAINS = [
   // OpenAI（规则集已有 openai.com/chatgpt.com/sora.com，这几个是补的）
@@ -733,7 +756,11 @@ ${p(picks)}
       - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9`;
 }
 function buildConfig(warp, opera, proton, wind) {
-  const { entries, proxies, v4Entries } = buildEntries(warp);
+  const { entries, proxies, v4Entries, teamEntries, teamProxies } = buildEntries(warp);
+  const zt = !!warp.zeroTrust && teamEntries.length > 0;
+  if (zt) proxies.push(...teamProxies);
+  const dialerPool = zt ? teamEntries : v4Entries;
+  const dialerFallback = v4Entries;
   const byLoc = {};
   for (const land of opera.landings) {
     for (const ent of entries) {
@@ -749,7 +776,7 @@ function buildConfig(warp, opera, proton, wind) {
   const protonByCC = {};
   if (proton && proton.servers && proton.servers.length) {
     proton.servers.forEach((srv, i) => {
-      const ent = v4Entries[i % v4Entries.length];
+      const ent = dialerPool[i % dialerPool.length] || dialerFallback[i % dialerFallback.length];
       protonNames.push(srv.name);
       const cc = srv.name.replace(/\d+$/, "");
       (protonByCC[cc] = protonByCC[cc] || []).push(srv.name);
@@ -769,7 +796,7 @@ function buildConfig(warp, opera, proton, wind) {
   const windByLoc = {};
   if (wind && wind.servers && wind.servers.length) {
     wind.servers.forEach((srv, i) => {
-      const ent = v4Entries[i % v4Entries.length];
+      const ent = dialerPool[i % dialerPool.length] || dialerFallback[i % dialerFallback.length];
       const name = `WS-${srv.tag}`;
       windNames.push(name);
       (windByLoc[srv.loc] = windByLoc[srv.loc] || []).push(name);
@@ -797,7 +824,8 @@ ${q(names)}`).join("\n\n");
     lazy: true
     proxies:
 ${q(names)}`).join("\n\n");
-  const picks = [...locNames, "WARP\u76F4\u8FDE"];
+  const picks = [...locNames, zt ? "ZT\u56E2\u961F\u8FB9\u7F18" : "WARP\u76F4\u8FDE"];
+  if (zt) picks.push("WARP\u76F4\u8FDE");
   if (protonNames.length) picks.push("Proton\u7EBF\u8DEF", ...protonCCNames);
   if (windNames.length) picks.push("Windscribe\u7EBF\u8DEF", ...windLocNames);
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}\u7EBF\u8DEF
@@ -808,6 +836,16 @@ ${q(names)}`).join("\n\n");
     lazy: true
     proxies:
 ${q(tags)}`).join("\n\n");
+  const ztGroupDef = zt ? `
+  - name: ZT\u56E2\u961F\u8FB9\u7F18
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    lazy: true
+    proxies:
+${q(teamEntries)}
+` : "";
   const { prov, rules } = buildRules();
   const yaml = `# Opera VPN over Cloudflare WARP (MASQUE)
 # \u7531 Cloudflare Worker \u751F\u6210\u4E8E ${(/* @__PURE__ */ new Date()).toISOString()}
@@ -816,11 +854,13 @@ ${q(tags)}`).join("\n\n");
 #
 #   \u4E9A\u6D32/\u6B27\u6D32/\u7F8E\u6D32\u7EBF\u8DEF  \u672C\u673A -> MASQUE -> Opera \u843D\u5730 -> \u76EE\u6807\uFF08\u80FD\u6362\u51FA\u53E3\u56FD\u5BB6\uFF09
 #   WARP\u76F4\u8FDE            \u672C\u673A -> MASQUE -> \u76EE\u6807\uFF08\u51FA\u53E3\u662F CF \u81EA\u5DF1\u7684 IP\uFF0C\u5FEB\uFF09
+${zt ? `#   ZT\u56E2\u961F\u8FB9\u7F18         \u672C\u673A -> MASQUE(\u56E2\u961F\u8FB9\u7F18 197.x) -> \u76EE\u6807\uFF08\u66F4\u7A33\uFF0C\u4EC5 Zero Trust \u53EF\u7528\uFF09` : ""}
 #
 # \u8282\u70B9\u540D "\u6B27\u6D321@198.1-443" = \u6B27\u6D32\u7B2C 1 \u4E2A\u843D\u5730\uFF0C\u7ECF 162.159.198.1:443 \u63A5\u5165\u3002
+# ZT- \u5F00\u5934\u7684\u662F Zero Trust \u56E2\u961F\u8FB9\u7F18\u8282\u70B9\uFF08162.159.197.x\uFF09\uFF0C\u514D\u8D39\u53F7\u8FDE\u4E0D\u4E0A\u3002
 #
 # \u63A5\u5165\u70B9 ${entries.length} \u4E2A x \u843D\u5730 ${opera.landings.length} \u4E2A = \u7EC4\u5408 ${combos} \u4E2A\uFF0C
-# \u5916\u52A0 ${entries.length} \u4E2A\u76F4\u8FDE\u63A5\u5165\u70B9${protonNames.length ? ` \u548C ${protonNames.length} \u4E2A Proton \u843D\u5730` : ""}${windNames.length ? ` \u548C ${windNames.length} \u4E2A Windscribe \u843D\u5730` : ""}\u3002
+# \u5916\u52A0 ${entries.length} \u4E2A\u76F4\u8FDE\u63A5\u5165\u70B9${zt ? ` \u548C ${teamEntries.length} \u4E2A ZT \u56E2\u961F\u8FB9\u7F18` : ""}${protonNames.length ? ` \u548C ${protonNames.length} \u4E2A Proton \u843D\u5730` : ""}${windNames.length ? ` \u548C ${windNames.length} \u4E2A Windscribe \u843D\u5730` : ""}\u3002
 # \u4EFB\u4E00\u73AF\u5931\u6548\u90FD\u6709\u66FF\u4EE3\u8DEF\u5F84\u3002
 #
 # \u9700\u8981 mihomo Alpha \u5206\u652F\uFF1A\u7A33\u5B9A\u7248\u6CA1\u6709 masque outbound\uFF0C\u4E5F\u4E0D\u8BA4 dialer-proxy\u3002
@@ -857,7 +897,7 @@ ${p(picks)}
 ${p(picks)}
 
 ${locDefs}
-
+${ztGroupDef}
   - name: WARP\u76F4\u8FDE
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -918,7 +958,9 @@ ${rules}
     landings: opera.landings.length,
     combos,
     proton: protonNames.length,
-    wind: windNames.length
+    wind: windNames.length,
+    zeroTrust: zt,
+    teamEdges: teamEntries.length
   };
 }
 
@@ -1235,7 +1277,7 @@ async function go(e){
 <\/script>
 </body></html>`;
 }
-function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage) {
+function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage, ztDevice) {
   const s = state || {};
   const warp = s.warp || {};
   const stat = s.stats || {};
@@ -1342,12 +1384,13 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         <button class="gh" onclick="location.href=document.getElementById('u').value">\u4E0B\u8F7D</button>
       </div>
       <div class="note">
-        \u4E00\u4EFD\u805A\u5408\uFF0C\u5BFC\u8FDB\u53BB\u6709\u4E24\u7C7B\u7EBF\u8DEF\u53EF\u5207\uFF1A<br>
+        \u4E00\u4EFD\u805A\u5408\uFF0C\u5BFC\u8FDB\u53BB\u6709\u51E0\u7C7B\u7EBF\u8DEF\u53EF\u5207\uFF1A<br>
         <b>\u4E9A\u6D32/\u6B27\u6D32/\u7F8E\u6D32\u7EBF\u8DEF</b> \u2014 \u8D70 MASQUE \u518D\u843D Opera\uFF0C\u80FD\u6362\u51FA\u53E3\u56FD\u5BB6\uFF0C\u4F46\u591A\u4E00\u8DF3\u4F1A\u6162\u4E9B\u3002<br>
         <b>WARP\u76F4\u8FDE</b> \u2014 \u53EA\u8D70 MASQUE\uFF0C\u51FA\u53E3\u662F Cloudflare \u81EA\u5DF1\u7684 IP\uFF0C\u5FEB\u4F46\u9009\u4E0D\u4E86\u56FD\u5BB6\u3002<br>
+        ${s.zeroTrust ? "<b>ZT\u56E2\u961F\u8FB9\u7F18</b> \u2014 \u8D70 197.x \u56E2\u961F\u8FB9\u7F18\uFF0C\u66F4\u7A33\uFF08Zero Trust \u542F\u7528\u540E\u51FA\u73B0\uFF09\u3002<br>" : ""}
         <b>Proton\u7EBF\u8DEF</b> \u2014 MASQUE \u6253\u5E95 + Proton WireGuard \u843D\u5730\uFF0C10 \u4E2A\u56FD\u5BB6\uFF08\u914D\u7F6E\u540E\u51FA\u73B0\uFF09\u3002<br>
         <b>Windscribe\u7EBF\u8DEF</b> \u2014 MASQUE \u6253\u5E95 + Windscribe \u843D\u5730\uFF0C13 \u4E2A\u5730\u533A\uFF0C\u6709\u9999\u6E2F\uFF08\u914D\u7F6E\u540E\u51FA\u73B0\uFF09\u3002<br>
-        \u5957\u5A03\u7EBF\u8DEF\u8D85\u65F6\u6216\u843D\u5730\u6302\u4E86\uFF0C\u5207 WARP\u76F4\u8FDE\u9876\u4E0A\u3002
+        \u5957\u5A03\u7EBF\u8DEF\u8D85\u65F6\u6216\u843D\u5730\u6302\u4E86\uFF0C\u5207${s.zeroTrust ? "ZT\u56E2\u961F\u8FB9\u7F18\u6216" : ""}WARP\u76F4\u8FDE\u9876\u4E0A\u3002
       </div>
       <div id="msg"></div>
     </div>
@@ -1358,13 +1401,14 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         <div class="cell"><div class="n">${stat.combos ?? "\u2014"}</div><div class="l">\u7EC4\u5408\u8282\u70B9</div></div>
         <div class="cell"><div class="n">${stat.entries ?? "\u2014"}</div><div class="l">MASQUE \u63A5\u5165\u70B9</div></div>
         <div class="cell"><div class="n">${stat.landings ?? "\u2014"}</div><div class="l">Opera \u843D\u5730</div></div>
-        <div class="cell"><div class="n">${stat.entries ?? "\u2014"}</div><div class="l">WARP \u76F4\u8FDE</div></div>
+        <div class="cell"><div class="n">${s.zeroTrust ? stat.teamEdges || "\u2014" : stat.entries ?? "\u2014"}</div><div class="l">${s.zeroTrust ? "ZT \u56E2\u961F\u8FB9\u7F18" : "WARP \u76F4\u8FDE"}</div></div>
         <div class="cell"><div class="n">${stat.proton || "\u2014"}</div><div class="l">Proton \u843D\u5730</div></div>
         <div class="cell"><div class="n">${stat.wind || "\u2014"}</div><div class="l">Windscribe \u843D\u5730</div></div>
       </div>
       <div class="note">
         \u6BCF\u4E2A\u843D\u5730\u548C\u6BCF\u4E2A\u63A5\u5165\u70B9\u90FD\u7EC4\u5408\u4E00\u904D\uFF0C\u4EFB\u4E00\u73AF\u5931\u6548\u90FD\u8FD8\u6709\u522B\u7684\u8DEF\u8D70\u3002<br>
-        \u8282\u70B9\u540D <b>\u6B27\u6D321@198.1-443</b> = \u6B27\u6D32\u7B2C 1 \u4E2A\u843D\u5730\uFF0C\u7ECF 162.159.198.1:443 \u63A5\u5165\u3002
+        \u8282\u70B9\u540D <b>\u6B27\u6D321@198.1-443</b> = \u6B27\u6D32\u7B2C 1 \u4E2A\u843D\u5730\uFF0C\u7ECF 162.159.198.1:443 \u63A5\u5165\u3002<br>
+        <b>ZT-</b> \u5F00\u5934\u7684\u662F Zero Trust \u56E2\u961F\u8FB9\u7F18\uFF08162.159.197.x\uFF09\uFF0C\u514D\u8D39\u53F7\u8FDE\u4E0D\u4E0A\u3002
       </div>
     </div>
 
@@ -1379,6 +1423,11 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
       ${row("\u5230\u671F\u65F6\u95F4", fmt(exp))}
       ${row("\u5BC6\u7801\u66F4\u65B0\u4E8E", cred && cred.updatedAt ? fmt(new Date(cred.updatedAt)) : "\u2014")}
       ${row("WARP \u8BBE\u5907", warp.deviceId ? warp.deviceId.slice(0, 8) + "\u2026" : "\u2014")}
+      ${row(
+    "\u8BBE\u5907\u6A21\u5F0F",
+    warp.zeroTrust ? "Zero Trust\uFF08\u56E2\u961F\u8FB9\u7F18\uFF09" : "\u514D\u8D39 WARP",
+    warp.zeroTrust ? "ok" : ""
+  )}
       ${row("WARP \u6CE8\u518C\u4E8E", warp.registeredAt ? fmt(new Date(warp.registeredAt)) : "\u2014")}
       ${row("\u5185\u7F51\u5730\u5740", warp.ipv4 || "\u2014")}
     </div>
@@ -1393,7 +1442,45 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         Opera \u51ED\u636E 4 \u5C0F\u65F6\u5230\u671F\u3002<b>\u4E0D\u7528\u5B9A\u65F6\u4EFB\u52A1</b>\u2014\u2014\u8BA2\u9605\u88AB\u8BBF\u95EE\u65F6\u624D\u68C0\u67E5\uFF0C
         \u6CA1\u8FC7\u671F\u76F4\u63A5\u7ED9\u7F13\u5B58\uFF0C\u8FC7\u671F\u4E86\u624D\u91CD\u65B0\u6CE8\u518C\u3002<br>
         \u60F3\u63D0\u524D\u6362\u4E00\u4EFD\u5C31\u70B9\u5237\u65B0\u3002<br>
-        WARP \u8BBE\u5907\u4FE1\u606F\u5B58\u5728 KV \u91CC\u590D\u7528\uFF0C<b>\u4E00\u822C\u4E0D\u7528\u91CD\u6CE8\u518C</b>\uFF0C\u9664\u975E MASQUE \u6574\u4F53\u8FDE\u4E0D\u4E0A\u3002
+        WARP \u8BBE\u5907\u4FE1\u606F\u5B58\u5728 KV \u91CC\u590D\u7528\uFF0C<b>\u4E00\u822C\u4E0D\u7528\u91CD\u6CE8\u518C</b>\uFF0C\u9664\u975E MASQUE \u6574\u4F53\u8FDE\u4E0D\u4E0A\u3002<br>
+        Zero Trust \u542F\u7528\u65F6\u91CD\u6CE8\u518C\u4F1A\u63D0\u793A\u5148\u6E05\u9664 ZT \u518D\u91CD\u65B0\u7C98 JWT\uFF08JWT \u53EA\u6709 60 \u79D2\u5BFF\u547D\uFF09\u3002
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">Zero Trust \u9AA8\u5E72</div>
+      ${ztDevice ? `
+      <div class="row"><span class="k">\u72B6\u6001</span><span class="v ok">\u5DF2\u542F\u7528 ${ztDevice.accountType || "team"}</span></div>
+      <div class="row"><span class="k">\u8BBE\u5907</span><span class="v">${ztDevice.deviceId ? ztDevice.deviceId.slice(0, 8) + "\u2026" : "\u2014"}</span></div>
+      <div class="row"><span class="k">\u6CE8\u518C\u4E8E</span><span class="v">${ztDevice.registeredAt ? fmt(new Date(ztDevice.registeredAt)) : "\u2014"}</span></div>
+      <div class="row"><span class="k">\u9AA8\u5E72\u8282\u70B9</span><span class="v">${stat.teamEdges || 0} \u4E2A\u56E2\u961F\u8FB9\u7F18\uFF08162.159.197.x\uFF09</span></div>
+      ` : `
+      <div class="row"><span class="k">\u72B6\u6001</span><span class="v warn">\u672A\u542F\u7528\uFF08\u7528\u514D\u8D39 WARP\uFF09</span></div>
+      `}
+      <div class="note" style="margin-bottom:10px">
+        Zero Trust \u628A WARP \u6CE8\u518C\u6210\u56E2\u961F\u8BBE\u5907\uFF0C\u7528\u4E0A MASQUE \u534F\u8BAE\u548C<b>\u56E2\u961F\u8FB9\u7F18
+        162.159.197.x</b>\u2014\u2014\u5B9E\u6D4B\u6BD4 198/199 \u90A3\u6279\u514D\u8D39\u8FB9\u7F18\u66F4\u7A33\uFF0C\u8FDE\u65AD\u90FD\u5C11\u3002
+        \u514D\u8D39\u5957\u9910 50 \u4E2A\u5E2D\u4F4D\uFF0C\u4E0D\u9650\u901F\u3002<br>
+        <b>\u5173\u4E8E\u9009\u56FD\u5BB6\u8981\u8BF4\u6E05\u695A</b>\uFF1AZero Trust \u514D\u8D39\u7248<b>\u4E0D\u80FD</b>\u76F4\u63A5\u9009\u51FA\u53E3\u56FD\u5BB6\uFF0C
+        \u51FA\u53E3\u4ECD\u7531 Cloudflare \u4EFB\u64AD\u5C31\u8FD1\u843D\uFF08\u591A\u534A\u662F\u65E7\u91D1\u5C71\uFF09\u3002\u8981\u9009\u56FD\u5BB6\u8D70\u7684\u662F\u4E0B\u9762
+        Proton / Windscribe / Opera \u90A3\u51E0\u6761\u843D\u5730\uFF0CZero Trust \u662F\u628A\u5B83\u4EEC\u7684\u9AA8\u5E72
+        \u6362\u5FEB\u6362\u7A33\u3002\u7EC4\u5408\u8D77\u6765\u5C31\u662F\u300C\u5FEB\u7684\u9AA8\u5E72 + \u80FD\u9009\u56FD\u5BB6\u300D\u3002
+      </div>
+      <div class="f" style="display:flex;flex-direction:column;gap:8px">
+        <input id="zt" placeholder="\u7C98 Team Token (JWT) \u2014\u2014 \u53EA\u6709 60 \u79D2\u5BFF\u547D\uFF0C\u62FF\u5230\u7ACB\u523B\u7C98"
+               spellcheck="false" autocomplete="off">
+        <div class="sub" style="margin-top:0">
+          <button onclick="enrollZt()">\u7ACB\u5373\u6CE8\u518C</button>
+          ${ztDevice ? `<button class="gh" onclick="go('/api/zt/clear')">\u6E05\u9664 ZT \u56DE\u9000\u514D\u8D39</button>` : ""}
+        </div>
+      </div>
+      <div class="note">
+        <b>\u600E\u4E48\u62FF JWT</b>\uFF1A\u6D4F\u89C8\u5668\u5F00 <code>https://&lt;\u4F60\u7684\u56E2\u961F\u540D&gt;.cloudflareaccess.com/warp</code>\uFF0C
+        \u5B8C\u6210\u90AE\u7BB1\u9A8C\u8BC1\u7801\u767B\u5F55\uFF0C\u5728\u6210\u529F\u9875\u9762\u7684\u6E90\u7801\u91CC\u627E <code>meta http-equiv="refresh"</code>\uFF0C
+        <code>token=</code> \u540E\u9762\u90A3\u4E32\u5C31\u662F\u3002\u6216\u8005\u63A7\u5236\u53F0\u8DD1
+        <code>document.querySelector("meta[http-equiv='refresh']").content.split("=")[2]</code>\u3002<br>
+        \u62FF\u5230<b>\u7ACB\u523B</b>\u7C98\u8FDB\u6765\u70B9\u6CE8\u518C\uFF0C\u8D85\u8FC7 60 \u79D2\u5C31\u5931\u6548\uFF0C\u4F1A\u62A5\u300C\u6CE8\u518C\u5230\u7684\u662F free \u8D26\u6237\u300D\u3002
+        \u6CE8\u518C\u6210\u529F\u540E\u8BBE\u5907\u957F\u671F\u6709\u6548\uFF0C\u4E0D\u7528\u53CD\u590D\u7C98\u3002
       </div>
     </div>
 
@@ -1538,6 +1625,13 @@ async function go(p){
     else{say('\u5931\u8D25: '+j.error,'var(--red)');bs.forEach(b=>b.disabled=false);}
   }catch(e){say('\u5931\u8D25: '+e.message,'var(--red)');bs.forEach(b=>b.disabled=false);}
 }
+async function enrollZt(){
+  const v=document.getElementById('zt').value.trim();
+  if(!v){say('\u628A JWT \u7C98\u8FDB\u6765','var(--red)');return;}
+  if(v.length<40){say('\u8FD9\u4E32\u592A\u77ED\uFF0C\u4E0D\u50CF JWT','var(--red)');return;}
+  // JWT \u5BFF\u547D 60 \u79D2\uFF0C\u6CE8\u518C\u8981\u8D81\u65E9
+  post('/api/zt/enroll',{jwt:v},'\u6CE8\u518C\u4E2D');
+}
 <\/script>
 </body></html>`;
 }
@@ -1639,6 +1733,7 @@ function normalizePath(p2) {
 
 // src/index.js
 var K_WARP = "warp:device";
+var K_ZT = "zt:device";
 var K_CFG = "config:yaml";
 var K_STATE = "state:meta";
 var K_CRED = "auth:cred";
@@ -1683,7 +1778,9 @@ async function getWind(env) {
   return await fetchWindscribe(acc);
 }
 async function rebuild(env, { forceWarp = false } = {}) {
-  const warp = await getWarp(env, forceWarp);
+  let zt = await env.KV.get(K_ZT, "json");
+  if (zt && (!zt.privateKey || !zt.ipv4)) zt = null;
+  const warp = zt || await getWarp(env, forceWarp && !zt);
   const opera = await fetchOpera();
   let proton = null;
   const pc = await env.KV.get(K_PROTON, "json");
@@ -1694,20 +1791,39 @@ async function rebuild(env, { forceWarp = false } = {}) {
   } catch (e) {
     windErr = e.message;
   }
-  const { yaml, entries, landings, combos, proton: pn, wind: wn } = buildConfig(warp, opera, proton, wind);
+  const {
+    yaml,
+    entries,
+    landings,
+    combos,
+    proton: pn,
+    wind: wn,
+    zeroTrust: ztFlag,
+    teamEdges
+  } = buildConfig(warp, opera, proton, wind);
   const now = Date.now();
   const state = {
     updatedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + TTL_MS).toISOString(),
-    stats: { entries, landings, combos, proton: pn || 0, wind: wn || 0 },
+    stats: {
+      entries,
+      landings,
+      combos,
+      proton: pn || 0,
+      wind: wn || 0,
+      teamEdges: teamEdges || 0
+    },
     protonExpiresAt: proton ? proton.expiresAt : null,
     wind: wind ? { userId: wind.account.userId, servers: wn || 0 } : null,
     windErr,
+    zeroTrust: ztFlag,
     warp: {
       deviceId: warp.deviceId,
       ipv4: warp.ipv4,
       ipv6: warp.ipv6,
-      registeredAt: warp.registeredAt
+      registeredAt: warp.registeredAt,
+      zeroTrust: !!warp.zeroTrust,
+      accountType: warp.accountType || ""
     }
   };
   await env.KV.put(K_CFG, yaml);
@@ -1825,6 +1941,32 @@ var index_default = {
           return json({ ok: true, msg: "\u8D26\u53F7\u5DF2\u5199\u5165\uFF0C\u4F46\u91CD\u5EFA\u914D\u7F6E\u5931\u8D25\uFF1A" + e.message });
         }
       }
+      if (kind === "zt") {
+        let dev;
+        try {
+          dev = JSON.parse(atob(body.trim()));
+        } catch {
+          return json({ ok: false, error: "\u4E0D\u662F\u5408\u6CD5\u7684 base64 JSON" }, 400);
+        }
+        if (!dev || !dev.privateKey || !dev.ipv4) {
+          return json({ ok: false, error: "\u7F3A privateKey \u6216 ipv4" }, 400);
+        }
+        if (dev.v !== 1) {
+          return json({ ok: false, error: `\u4E0D\u8BA4\u8BC6\u7684\u7248\u672C v${dev.v}` }, 400);
+        }
+        dev.zeroTrust = true;
+        if (!dev.accountType) dev.accountType = "team";
+        await env.KV.put(K_ZT, JSON.stringify(dev));
+        try {
+          const st = await rebuild(env);
+          return json({
+            ok: true,
+            msg: `\u5DF2\u5199\u5165 Zero Trust \u8BBE\u5907\uFF0C${st.stats.teamEdges} \u4E2A\u56E2\u961F\u8FB9\u7F18\u5DF2\u52A0\u5165`
+          });
+        } catch (e) {
+          return json({ ok: true, msg: "\u8BBE\u5907\u5DF2\u5199\u5165\uFF0C\u4F46\u91CD\u5EFA\u914D\u7F6E\u5931\u8D25\uFF1A" + e.message });
+        }
+      }
       let parsed;
       try {
         parsed = parseBlob(body);
@@ -1876,6 +2018,7 @@ var index_default = {
       const token = await signToken(cred);
       const pushToken = await env.KV.get(K_PUSH);
       const protonCred = await env.KV.get(K_PROTON, "json");
+      const ztDevice = await env.KV.get(K_ZT, "json");
       let windUsage = null;
       const wa = await env.KV.get(K_WIND, "json");
       if (wa && wa.sessionAuthHash) {
@@ -1893,7 +2036,8 @@ var index_default = {
         cred,
         pushToken,
         protonCred,
-        windUsage
+        windUsage,
+        ztDevice
       ));
     }
     if (!authed) return notFound();
@@ -1955,12 +2099,51 @@ var index_default = {
       }
     }
     if (path === "/api/reset-warp" && req.method === "POST") {
+      const zt = await env.KV.get(K_ZT, "json");
+      if (zt) {
+        return json({
+          ok: false,
+          error: "\u5F53\u524D\u7528\u7684\u662F Zero Trust \u8BBE\u5907\uFF0C\u4E0D\u80FD\u9759\u9ED8\u91CD\u6CE8\u518C\u3002\u5148\u70B9\u300C\u6E05\u9664 Zero Trust\u300D\uFF0C\u518D\u7C98\u4E00\u4EFD\u65B0 JWT \u91CD\u65B0\u6CE8\u518C\u3002"
+        });
+      }
       try {
         const s = await rebuild(env, { forceWarp: true });
         return json({ ok: true, msg: `WARP \u5DF2\u91CD\u6CE8\u518C\uFF0C${s.stats.combos} \u4E2A\u7EC4\u5408` });
       } catch (e) {
         return json({ ok: false, error: e.message }, 500);
       }
+    }
+    if (path === "/api/zt/enroll" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const jwt = String(body.jwt || "").trim();
+      if (!jwt) return json({ ok: false, error: "\u628A Team Token \u7C98\u8FDB\u6765" }, 400);
+      if (jwt.length < 40) {
+        return json({ ok: false, error: "\u8FD9\u4E2A\u4E0D\u50CF JWT\uFF0C\u592A\u77ED\u4E86\u3002\u56DE\u7BA1\u7406\u9875\u91CD\u65B0\u62FF\u4E00\u4E2A\u3002" }, 400);
+      }
+      try {
+        const dev = await registerWarp("cf-worker-zt", jwt);
+        await env.KV.put(K_ZT, JSON.stringify(dev));
+        let st;
+        try {
+          st = await rebuild(env);
+        } catch (e) {
+          return json({ ok: true, msg: "\u8BBE\u5907\u5DF2\u6CE8\u518C\uFF0C\u4F46\u91CD\u5EFA\u914D\u7F6E\u5931\u8D25\uFF1A" + e.message });
+        }
+        return json({
+          ok: true,
+          msg: `\u5DF2\u6CE8\u518C Zero Trust \u8BBE\u5907\uFF0C\u56E2\u961F\u8FB9\u7F18 ${st.stats.teamEdges} \u4E2A\u5DF2\u52A0\u5165\u8BA2\u9605`
+        });
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 500);
+      }
+    }
+    if (path === "/api/zt/clear" && req.method === "POST") {
+      await env.KV.delete(K_ZT);
+      try {
+        await rebuild(env);
+      } catch {
+      }
+      return json({ ok: true, msg: "\u5DF2\u6E05\u9664 Zero Trust\uFF0C\u56DE\u9000\u5230\u514D\u8D39 WARP" });
     }
     if (path === "/api/wind/clear" && req.method === "POST") {
       await env.KV.delete(K_WIND);

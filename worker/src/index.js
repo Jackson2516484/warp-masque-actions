@@ -5,7 +5,9 @@
 // 职责:
 //   1. 订阅被访问时按需重建：Opera 凭据没过期就直接给缓存，
 //      过期了才重新注册。凭据有效期 4 小时（opera-proxy 的 -refresh 默认值）
-//   2. WARP 注册信息存 KV 复用，不每次重注册（设备是有限资源）
+//   2. WARP 注册信息存 KV 复用，不每次重注册（设备是有限资源）。
+//      Zero Trust 设备（粘 JWT 注册或流水线推来）也存 KV，启用后做骨干，
+//      走团队边缘 162.159.197.x；没有就回退 consumer WARP
 //   3. 首次访问引导设密码，之后订阅路径、改密码都在界面里做
 import { registerWarp } from "./warp.js";
 import { fetchOpera } from "./opera.js";
@@ -19,6 +21,7 @@ import {
 } from "./auth.js";
 
 const K_WARP = "warp:device";     // WARP 注册信息，长期复用
+const K_ZT = "zt:device";         // Zero Trust 注册信息（团队边缘用），长期复用
 const K_CFG = "config:yaml";      // 聚合配置（套娃线路 + WARP 直连）
 const K_STATE = "state:meta";     // 状态元数据，给 UI 用
 const K_CRED = "auth:cred";       // 密码哈希 + 盐
@@ -86,9 +89,20 @@ async function getWind(env) {
   return await fetchWindscribe(acc);
 }
 
-/** 重建配置。WARP 复用，Opera 每次重取（凭据会过期）。 */
+/** 重建配置。WARP 复用，Opera 每次重取（凭据会过期）。
+ *
+ * Zero Trust 设备存在时用它做骨干（团队边缘更稳、免 MASQUE、不限速），
+ * 没有就回退到 consumer WARP。两者结构一样，config.js 看 zeroTrust
+ * 标志决定要不要放团队边缘节点。
+ */
 async function rebuild(env, { forceWarp = false } = {}) {
-  const warp = await getWarp(env, forceWarp);
+  // 先看 ZT 设备要不要重建。forceWarp 是给 consumer 那套用的，
+  // ZT 设备有自己的 /api/zt/clear，这里不动它。
+  let zt = await env.KV.get(K_ZT, "json");
+  // ZT 设备在但凭据残缺（比如没拿到 ipv4）就当没有，避免配出来残废节点
+  if (zt && (!zt.privateKey || !zt.ipv4)) zt = null;
+
+  const warp = zt || await getWarp(env, forceWarp && !zt);
   const opera = await fetchOpera();
   // Proton 凭据是流水线推来的，没有就跳过，不影响其他线路
   let proton = null;
@@ -103,22 +117,27 @@ async function rebuild(env, { forceWarp = false } = {}) {
   } catch (e) {
     windErr = e.message;
   }
-  const { yaml, entries, landings, combos, proton: pn, wind: wn } =
+  const { yaml, entries, landings, combos, proton: pn, wind: wn,
+          zeroTrust: ztFlag, teamEdges } =
     buildConfig(warp, opera, proton, wind);
 
   const now = Date.now();
   const state = {
     updatedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + TTL_MS).toISOString(),
-    stats: { entries, landings, combos, proton: pn || 0, wind: wn || 0 },
+    stats: { entries, landings, combos, proton: pn || 0, wind: wn || 0,
+             teamEdges: teamEdges || 0 },
     protonExpiresAt: proton ? proton.expiresAt : null,
     wind: wind ? { userId: wind.account.userId, servers: wn || 0 } : null,
     windErr,
+    zeroTrust: ztFlag,
     warp: {
       deviceId: warp.deviceId,
       ipv4: warp.ipv4,
       ipv6: warp.ipv6,
       registeredAt: warp.registeredAt,
+      zeroTrust: !!warp.zeroTrust,
+      accountType: warp.accountType || "",
     },
   };
 
@@ -239,8 +258,9 @@ export default {
     // 它只能写 Proton 凭据，动不了管理页；泄露了在管理页换一个即可。
     if (path.startsWith("/push/") && req.method === "POST") {
       const tk = await env.KV.get(K_PUSH);
-      // 路径可以带类型后缀：/push/<令牌> 是 Proton，/push/<令牌>/wind 是 Windscribe。
-      // 同一个令牌收两种，Actions 那边还是只配一个 secret。
+      // 路径可以带类型后缀：/push/<令牌> 是 Proton，/push/<令牌>/wind 是
+      // Windscribe，/push/<令牌>/zt 是 Zero Trust。同一个令牌收三种，
+      // Actions 那边还是只配一个 secret。
       const rest = path.slice(6);
       const slash = rest.indexOf("/");
       const got = slash < 0 ? rest : rest.slice(0, slash);
@@ -271,6 +291,35 @@ export default {
           return json({ ok: true, msg: `已写入 Windscribe 账号，${st.stats.wind} 台落地` });
         } catch (e) {
           return json({ ok: true, msg: "账号已写入，但重建配置失败：" + e.message });
+        }
+      }
+
+      if (kind === "zt") {
+        // Zero Trust 设备由 Actions 流水线用 usque 注册好推过来。
+        // blob 是 base64(JSON)，里面是 MASQUE 密钥 + 内网地址 + zeroTrust 标记。
+        // 拿到就当骨干存进 KV，rebuild 时会用它放团队边缘节点。
+        let dev;
+        try {
+          dev = JSON.parse(atob(body.trim()));
+        } catch {
+          return json({ ok: false, error: "不是合法的 base64 JSON" }, 400);
+        }
+        if (!dev || !dev.privateKey || !dev.ipv4) {
+          return json({ ok: false, error: "缺 privateKey 或 ipv4" }, 400);
+        }
+        if (dev.v !== 1) {
+          return json({ ok: false, error: `不认识的版本 v${dev.v}` }, 400);
+        }
+        // 强制标记成 Zero Trust，不管流水线那边写了什么
+        dev.zeroTrust = true;
+        if (!dev.accountType) dev.accountType = "team";
+        await env.KV.put(K_ZT, JSON.stringify(dev));
+        try {
+          const st = await rebuild(env);
+          return json({ ok: true,
+            msg: `已写入 Zero Trust 设备，${st.stats.teamEdges} 个团队边缘已加入` });
+        } catch (e) {
+          return json({ ok: true, msg: "设备已写入，但重建配置失败：" + e.message });
         }
       }
 
@@ -328,6 +377,7 @@ export default {
       const token = await signToken(cred);
       const pushToken = await env.KV.get(K_PUSH);
       const protonCred = await env.KV.get(K_PROTON, "json");
+      const ztDevice = await env.KV.get(K_ZT, "json");
       // 用量是实时问 Windscribe 的，问不到就不显示，不影响页面其他部分
       let windUsage = null;
       const wa = await env.KV.get(K_WIND, "json");
@@ -335,7 +385,7 @@ export default {
         try { windUsage = await fetchSession(wa); } catch { windUsage = null; }
       }
       return html(renderUI(state, url.host, subPath, token, cred,
-                           pushToken, protonCred, windUsage));
+                           pushToken, protonCred, windUsage, ztDevice));
     }
 
     // ---- 以下都要登录。未登录一律 404，不用 401 ----
@@ -410,14 +460,59 @@ export default {
       }
     }
 
-    // 重注册 WARP 设备，MASQUE 整体不通时才用
+    // 重注册 WARP 设备，MASQUE 整体不通时才用。
+    // Zero Trust 启用时这条没意义：ZT 重注册要新的 60 秒 JWT，
+    // 不能静默做。引导用户走「清除 ZT → 重新粘 JWT」。
     if (path === "/api/reset-warp" && req.method === "POST") {
+      const zt = await env.KV.get(K_ZT, "json");
+      if (zt) {
+        return json({ ok: false,
+          error: "当前用的是 Zero Trust 设备，不能静默重注册。" +
+                 "先点「清除 Zero Trust」，再粘一份新 JWT 重新注册。" });
+      }
       try {
         const s = await rebuild(env, { forceWarp: true });
         return json({ ok: true, msg: `WARP 已重注册，${s.stats.combos} 个组合` });
       } catch (e) {
         return json({ ok: false, error: e.message }, 500);
       }
+    }
+
+    // 用 Zero Trust 的 Team Token（JWT）注册团队设备。
+    //
+    // JWT 只有 60 秒寿命，所以必须在这里立刻用掉，不能存起来改天用。
+    // 注册成功后拿到的是长期有效的设备凭据，存进 KV 复用，之后
+    // rebuild 会拿它当骨干、把团队边缘 197.x 放进订阅。
+    //
+    // 这条要登录才能打：JWT 等同你 Zero Trust 团队的临时钥匙，
+    // 敞着放等于谁都能往你团队塞设备。
+    if (path === "/api/zt/enroll" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const jwt = String(body.jwt || "").trim();
+      if (!jwt) return json({ ok: false, error: "把 Team Token 粘进来" }, 400);
+      if (jwt.length < 40) {
+        return json({ ok: false, error: "这个不像 JWT，太短了。回管理页重新拿一个。" }, 400);
+      }
+      try {
+        const dev = await registerWarp("cf-worker-zt", jwt);
+        await env.KV.put(K_ZT, JSON.stringify(dev));
+        let st;
+        try { st = await rebuild(env); }
+        catch (e) {
+          return json({ ok: true, msg: "设备已注册，但重建配置失败：" + e.message });
+        }
+        return json({ ok: true,
+          msg: `已注册 Zero Trust 设备，团队边缘 ${st.stats.teamEdges} 个已加入订阅` });
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 500);
+      }
+    }
+
+    // 清掉 Zero Trust 设备，回退到 consumer WARP。
+    if (path === "/api/zt/clear" && req.method === "POST") {
+      await env.KV.delete(K_ZT);
+      try { await rebuild(env); } catch { /* 重建失败不影响清除本身 */ }
+      return json({ ok: true, msg: "已清除 Zero Trust，回退到免费 WARP" });
     }
 
     // 清掉 Windscribe 账号。换号要重跑流水线 —— Worker 自己开不出可用的号
