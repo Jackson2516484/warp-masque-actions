@@ -387,6 +387,9 @@ var V6 = [
   "2606:4700:104::2"
 ];
 var PORTS = [443, 500, 1701, 4500, 4443, 8443, 8095];
+var TEAM_V4 = ["162.159.197.1", "162.159.197.2"];
+var TEAM_PORTS = [443, 8443];
+var ZT_SNI = "zt-masque.cloudflareclient.com";
 var OFFICIAL_SNI = "zt-masque.cloudflareclient.com";
 var SNI_NODE = ["162.159.198.1", 443];
 var RS = "https://raw.githubusercontent.com";

@@ -7,6 +7,10 @@ const V4 = ["162.159.198.1", "162.159.198.2", "162.159.199.1", "162.159.199.2"];
 const V6 = ["2606:4700:103::1", "2606:4700:103::2",
             "2606:4700:104::1", "2606:4700:104::2"];
 const PORTS = [443, 500, 1701, 4500, 4443, 8443, 8095];
+const TEAM_V4 = ["162.159.197.1", "162.159.197.2"];
+const TEAM_PORTS = [443, 8443];
+const ZT_SNI = "zt-masque.cloudflareclient.com";
+
 
 // CF 没有 A 记录指向 MASQUE 段，官方域名只能用在 SNI 上
 const OFFICIAL_SNI = "zt-masque.cloudflareclient.com";
