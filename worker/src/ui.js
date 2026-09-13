@@ -318,6 +318,10 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         ${s.zeroTrust ? '<b>ZT团队边缘</b> — 走 197.x 团队边缘，更稳（Zero Trust 启用后出现）。<br>' : ""}
         <b>Proton线路</b> — MASQUE 打底 + Proton WireGuard 落地，10 个国家（配置后出现）。<br>
         <b>Windscribe线路</b> — MASQUE 打底 + Windscribe 落地，13 个地区，有香港（配置后出现）。<br>
+        <b>🌐 落地出口</b> — 出口 IP 敏感站点（Play / 维基 / 成人站 / AI）的专用出口，
+        默认按「能换出口的落地 → 团队边缘 → 免费边缘」排优先级。<br>
+        <b>⚡ 聚合</b> — 并发连接分散到多条隧道，单隧道跑不快时用。<br>
+        <b>🚫 QUIC</b> — QUIC 总开关，默认 REJECT（浏览器自动回退 TCP），个别 App 要用就切 DIRECT。<br>
         套娃线路超时或落地挂了，切${s.zeroTrust ? "ZT团队边缘或" : ""}WARP直连顶上。
       </div>
       <div id="msg"></div>

@@ -92,6 +92,75 @@ Surge、Quantumult X、Karing 不是 mihomo 内核，也不认 masque，导进�
 里面有 28 个 IPv6 节点，你没 IPv6 的话它们会连不上，但客户端会自动跳过，
 不影响用。
 
+## 默认调优
+
+生成出来的配置不是裸的 57 个节点，默认带了几处调优。都遵循一个原则：
+默认值合理，但需要时能关掉。
+
+**关 QUIC**
+
+浏览器默认走 QUIC（UDP 443）。在 MASQUE 隧道里再跑一层 QUIC 等于套了两层，
+握手和丢包恢复都被放大，表现就是 Google 系一直转圈。配置里第一条规则把
+UDP 443 拦掉，浏览器探测到不通会自动回退 TCP，用户无感。
+
+要给某个 App 放行，在客户端的 `🚫 QUIC` 组里切成 `DIRECT` 就行。
+
+**🌐 落地出口**
+
+Google Play、维基百科、成人站这类站点会按「是不是机房/VPN IP」拦人，
+而 WARP 的出口是 Cloudflare 共享段，被标记得很厉害。这个组的成员按优先级排：
+
+```
+Proton线路 / Windscribe线路  →  亚洲 / 欧洲 / 美洲线路  →  ZT团队边缘  →  WARP直连
+     能换出口国家                    能换出口国家              更稳           兜底
+```
+
+Play 的下载 CDN（`*.gvt1.com`、`dl.google.com`）也在里面 —— 商店页面打得开
+但装不上、更新失败，基本都是这几条没走代理落到国内直连去了。
+
+`🤖 AI服务` 组的首选成员也指向它。
+
+> 纯 WARP 那条流水线没有落地可换，那边只保证这些域名一定走代理，不换出口。
+
+**⚡ 聚合**
+
+`load-balance` 组，把并发连接分散到多个接入点。57 个接入点是同一个 WARP
+账号、出口 IP 相同，所以不存在会话对不上的问题。单隧道跑不快（用户态 QUIC
+栈的常见瓶颈）时切过去，下载类场景改善明显。只收 IPv4 接入点 —— 混进 IPv6
+节点在纯 IPv4 的机器上会 `network is unreachable`。
+
+**自动选择不再套娃**
+
+原来 `♻️ 自动选择` 是 `url-test` 套 `url-test`，成员全是组。嵌套组的延迟取的是
+子组「当前选中节点」的旧值，不刷新就一直是旧值 —— 这是「自动选择挑不到最快」
+的根因。现在摊平成真实接入点，关掉 `lazy`（开机就测）、`interval` 压到 180s、
+`tolerance` 收到 40。ZT 团队边缘组同样处理。
+
+**DNS 不吃 AAAA**
+
+`dns.ipv6` 固定 `false`，顶层 `ipv6` 还是 `true`。fake-ip 模式下一旦还回答
+AAAA，客户端会优先拿 IPv6 去连目标；本地 IPv6 出口烂的时候，表现就是
+「延迟不高但打不开」。顶层保持 true 是为了让 IPv6 接入点本身还能用
+（那是直连字面地址，不走 DNS）。
+
+### 想按当前网络自动挑最快的
+
+`url-test` 只测延迟（一个 204 请求的 RTT），不测带宽 —— 延迟最低 ≠ 最快。
+同一批接入点，家庭宽带上可能 `198.x:443` 最快，换到 4G 热点就变成
+`199.x:8443` 最快：运营商对不同 IP / 端口段的 QoS 不一样。
+
+要按「当前这条网络」实测，用 `scripts/pick_fastest.py`。它先用 mihomo API
+并发测所有节点延迟，再取最快的几个真实下载测吞吐，最后把最快的设上：
+
+```bash
+# 先 mihomo API 可达（客户端里的 external-controller 默认 127.0.0.1:9090）
+python3 scripts/pick_fastest.py --sub warp-masque.yaml
+python3 scripts/pick_fastest.py --sub warp-masque.yaml --watch   # 换网络自动重测
+```
+
+`--watch` 用「本地出口 IP + 默认网关」当指纹，换 WiFi、插网线、切热点都会触发
+重测。只依赖标准库。
+
 ## 几个提醒
 
 配置里的 `private-key` 相当于账号密码，别往外发。artifact 默认存 7 天，
@@ -142,7 +211,38 @@ uses: actions/upload-artifact@v6
 57 个节点是同一个 WARP 账号的不同接入地址，**出口 IP 是同一个**。
 延迟差异来自你到接入点的网络路径，真正落地的还是那台 Cloudflare 机器。
 
-所以挑延迟最低的用就行，不用一个个试速度。
+所以别一个个手试。但要注意：**延迟最低不等于最快** —— `url-test` 只测一个
+204 请求的 RTT，不测带宽。要按吞吐挑，跑 `scripts/pick_fastest.py` 实测一轮。
+
+### 桌面端很卡，但手机官方客户端的同一个 Zero Trust 很快
+
+不是节点的问题，是客户端实现的问题：
+
+- 手机官方客户端是系统级 NetworkExtension / VpnService + WireGuard，跑在近内核层
+- mihomo 的 `masque` 是 Alpha 分支的用户态 QUIC 栈（quic-go），外面再套 TUN +
+  用户态 TCP/IP 栈，**单核 CPU 打满就是速度天花板**
+
+按这个顺序排：
+
+1. 把内核升到**最新** Alpha（旧 Alpha 的 masque 性能差很多）
+2. 跑 `scripts/pick_fastest.py`，按当前这条网络实测挑接入点
+3. 还嫌慢就切 `⚡ 聚合`，把并发连接摊到多条隧道上
+
+### 某些国外站打不开（Google Play / 维基 / AI）
+
+三种原因，分开处理：
+
+1. **出口 IP 信誉**。WARP 出口是 Cloudflare 共享段，Play、成人站、AI 站会直接拦。
+   在 `🌐 落地出口` 组里换一个落地（Proton / Windscribe / Opera 地区线路）。
+2. **双重 QUIC**。规则里已经拦掉了。如果手动在 `🚫 QUIC` 组切成 `DIRECT`
+   之后又打不开，切回 `REJECT`。
+3. **被判成直连**。Play / 维基 / AI 的域名已经加了内联规则，排在所有 RULE-SET
+   前面。还不行就在客户端日志里看这条连接命中的规则名。
+
+**关于 AI 要说清楚**：ChatGPT / Claude 这类对机房 IP 的封锁比 WARP 还狠，
+仓库里这三条落地（Opera / Proton / Windscribe）**全是机房 IP**，换过去只能
+提高成功率、做不到稳定。要稳就得自备住宅或 VPS 出口，接法跟套 Proton 一样：
+加一个 `type: ss/vmess/...` 的节点，`dialer-proxy` 指向 MASQUE 接入点。
 
 ### artifact 过期了怎么办
 
@@ -178,7 +278,7 @@ Failed to connect tunnel: login failed!
 
 ## 想改配置
 
-`scripts/gen_masque.py` 顶部三个常量控制节点池：
+`scripts/gen_masque.py` 顶部几个常量：
 
 ```python
 V4    = [...]   # IPv4 接入地址
@@ -187,6 +287,11 @@ PORTS = (...)   # 端口
 ```
 
 分流规则用的是 ACL4SSR，改 `RULESETS` 那个列表。
+
+出口 IP 敏感的那批域名（Play / 维基 / 成人站）在 `PLAY_DOMAINS` /
+`WIKI_DOMAINS` / `ADULT_DOMAINS` 里，想加自己的域名就往对应列表里塞。
+**这三个列表在 `worker/src/config.js` 里有一份同样的**，两边要一起改 ——
+`worker/test/config.test.mjs` 只测 Worker 那份，那边漏了 CI 不会报。
 
 ---
 
@@ -264,6 +369,10 @@ Actions 那条要手动点一下才跑。如果想要它自己更新、随时有
 - **ZT团队边缘** — 配了 Zero Trust 之后出现，走 162.159.197.x 团队边缘，更稳
 - **Proton线路** — 配了 Proton 之后出现，下面按国家分组，可以直接选日本、新加坡等
 - **Windscribe线路** — 13 个地区，按地区分组。亚洲只有香港，但 Opera 那三个大区里没有
+- **🌐 落地出口** — 出口 IP 敏感站点（Play / 维基 / 成人站 / AI）的专用出口，
+  默认按「能换出口的落地 → 团队边缘 → 免费边缘」排优先级，见[默认调优](#默认调优)
+- **⚡ 聚合** — 并发连接分散到多条隧道，单隧道跑不快时用
+- **🚫 QUIC** — QUIC 总开关，默认 `REJECT`，个别 App 要用就切 `DIRECT`
 
 套娃线路超时或某个落地挂了，切 WARP直连（或 ZT团队边缘）顶上。这几类共用同一批
 MASQUE 接入点，直连组本来就在配置里（做 dialer-proxy 的目标），顺手暴露出来而已。
@@ -543,11 +652,13 @@ Actions 里选 `取 Zero Trust 凭据`，把 JWT 粘进 `jwt` 输入框跑。用
 cd worker && npm test
 ```
 
-180 项，覆盖常数时间比较、token 伪造/篡改/过期、登录限速、并发初始化，
+198 项，覆盖常数时间比较、token 伪造/篡改/过期、登录限速、并发初始化，
 Proton/Windscribe/Zero Trust 凭据推送（令牌校验、坏数据、降额/非 team 账户拒绝、
 换令牌失效），配置结构（分组完整性、无悬空引用、直连组成员正确、ZT 团队边缘
-只在 team 设备启用、落地走团队边缘骨干），以及路由层的鉴权（未登录一律 404、
-订阅 token 校验、按需重建、cookie 安全属性）。
+只在 team 设备启用、落地走团队边缘骨干、聚合组只收 IPv4 接入点、自动选择不再
+嵌套引用分组、QUIC 规则排在最前、敏感域名规则排在 RULE-SET 之前、DNS 不吃
+AAAA），以及路由层的鉴权（未登录一律 404、订阅 token 校验、按需重建、
+cookie 安全属性）。
 
 ### 两个坑
 

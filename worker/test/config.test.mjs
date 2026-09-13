@@ -233,6 +233,75 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("免费 WARP 标记 ZT 关", consumer.zeroTrust === false && consumer.teamEdges === 0);
 }
 
+// 调优项：关 QUIC / 出口 IP 敏感域名 / 自动选择不再套娃 / DNS 不吃 AAAA
+{
+  const y = buildConfig(warp, opera).yaml;
+  const gs = [...y.matchAll(/^  - name: (.+)$/gm)].map((m) => m[1]);
+  const entryNames = [...y.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
+
+  // 关 QUIC。必须排在全部规则最前面：浏览器用的 QUIC 在 MASQUE 隧道里
+  // 等于套两层 QUIC，Google 系会一直转圈；拦掉之后自动回退 TCP。
+  const rulesBlock = y.slice(y.indexOf("\nrules:\n") + "\nrules:\n".length);
+  const firstRule = rulesBlock.split("\n")[0];
+  t("第一条规则是关 QUIC",
+    firstRule.includes("AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC"));
+  t("有 🚫 QUIC 组", gs.includes("🚫 QUIC"));
+
+  // 测速脚本靠这条量真实吞吐，落到直连就量成自家宽带了
+  t("测速域名钉走代理",
+    y.includes("DOMAIN-SUFFIX,speed.cloudflare.com,🚀 节点选择"));
+
+  // Play 的下载 CDN 是最常漏的一环：商店能打开但装不上，就是这几条没走代理
+  const playMust = ["play.google.com", "play.googleapis.com", "android.clients.google.com",
+                    "dl.google.com", "gvt1.com"];
+  const playMiss = playMust.filter((d) => !y.includes(`DOMAIN-SUFFIX,${d},🌐 落地出口`));
+  t(`Play 商店+下载CDN 走落地出口${playMiss.length ? " 缺:" + playMiss : ""}`,
+    playMiss.length === 0);
+  const wikiMiss = ["wikipedia.org", "wikimedia.org"].filter(
+    (d) => !y.includes(`DOMAIN-SUFFIX,${d},🌐 落地出口`));
+  t(`维基媒体走落地出口${wikiMiss.length ? " 缺:" + wikiMiss : ""}`, wikiMiss.length === 0);
+
+  // 内联规则必须排在 RULE-SET 之前，否则会被上游更宽的条目抢先命中
+  const rs = y.indexOf("  - RULE-SET,");
+  const sens = y.indexOf("  - DOMAIN-SUFFIX,play.google.com,🌐 落地出口");
+  t("敏感域名规则排在 RULE-SET 前", sens > 0 && sens < rs);
+
+  // 🌐 落地出口 只允许引用真实存在的组，否则内核直接加载失败
+  t("有 🌐 落地出口 组", gs.includes("🌐 落地出口"));
+  const land = y.split("  - name: 🌐 落地出口")[1].split("\n  - name:")[0];
+  const landMembers = [...land.matchAll(/^      - (.+)$/gm)].map((m) => m[1].trim());
+  t("落地出口含地区线路", land.includes("亚洲线路") && land.includes("欧洲线路"));
+  t("落地出口成员都是已定义的组",
+    landMembers.filter((m) => m !== "DIRECT").every((m) => gs.includes(m)));
+
+  // ⚡ 聚合：同一个 WARP 账号出口 IP 相同，分散连接是安全的；
+  // 但只收 IPv4 接入点，混进 v6 在纯 IPv4 机器上会 network is unreachable
+  t("有 ⚡ 聚合 组", gs.includes("⚡ 聚合"));
+  const agg = y.split("  - name: ⚡ 聚合")[1].split("\n  - name:")[0];
+  t("聚合是 load-balance", /type: load-balance/.test(agg));
+  const aggMembers = [...agg.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`聚合 ${aggMembers.length} 个成员全是 IPv4 接入点`,
+    aggMembers.length > 0 &&
+    aggMembers.every((m) => !m.startsWith("v6-") && entryNames.includes(m)));
+
+  // ♻️ 自动选择：不能再是 url-test 套 url-test。嵌套组的延迟取的是子组
+  // 当前选中节点的旧值，不刷新就一直是旧值 —— 「挑不到最快」的根因。
+  const auto = y.split("  - name: ♻️ 自动选择")[1].split("\n  - name:")[0];
+  const autoMembers = [...auto.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`自动选择 ${autoMembers.length} 个成员都是真实接入点`,
+    autoMembers.length > 0 && autoMembers.every((m) => entryNames.includes(m)));
+  t("自动选择不再含组名",
+    !auto.includes("      - 亚洲线路") && !autoMembers.includes("亚洲线路"));
+  t("自动选择关掉 lazy", /lazy: false/.test(auto));
+
+  // DNS 不能回答 AAAA：本地 IPv6 出口烂的时候，返回 AAAA 会让客户端
+  // 优先往 v6 上撞，表现就是「延迟不高但打不开」
+  const dnsBlock = y.slice(y.indexOf("\ndns:\n"), y.indexOf("\nproxies:\n"));
+  t("DNS 关掉 IPv6", /^  ipv6: false$/m.test(dnsBlock));
+  t("顶层 IPv6 保留（v6 接入点还要能用）", /^ipv6: true$/m.test(y));
+  t("AI 域名钉境外 DNS", dnsBlock.includes("'+.openai.com':"));
+}
+
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);
 

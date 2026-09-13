@@ -597,6 +597,52 @@ var AI_DOMAINS = [
   "siliconflow.cn",
   "dashscope.aliyuncs.com"
 ];
+var PLAY_DOMAINS = [
+  // Google Play 本体 + 下载 CDN。下载 CDN 是最常被漏掉的一环：
+  // 商店页面能打开、但装不上 / 更新失败，基本都是 *.gvt1.com / dl.google.com
+  // 没走代理，落到国内直连去了。
+  "play.google.com",
+  "play.googleapis.com",
+  "android.clients.google.com",
+  "dl.google.com",
+  "dl-ssl.google.com",
+  "gvt1.com",
+  "gvt2.com",
+  "gvt3.com",
+  "ggpht.com",
+  "googleusercontent.com"
+];
+var WIKI_DOMAINS = [
+  "wikipedia.org",
+  "wikimedia.org",
+  "wikidata.org",
+  "wikisource.org",
+  "wiktionary.org",
+  "wikibooks.org",
+  "wikinews.org",
+  "wikiversity.org",
+  "wikiquote.org",
+  "mediawiki.org"
+];
+var ADULT_DOMAINS = [
+  "pornhub.com",
+  "pornhubpremium.com",
+  "xvideos.com",
+  "xnxx.com",
+  "xhamster.com",
+  "redtube.com",
+  "youporn.com",
+  "spankbang.com",
+  "beeg.com",
+  "eporner.com",
+  "txxx.com",
+  "hqporner.com"
+];
+var SENSITIVE_ROUTES = [
+  ...PLAY_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "\u{1F310} \u843D\u5730\u51FA\u53E3"]),
+  ...WIKI_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "\u{1F310} \u843D\u5730\u51FA\u53E3"]),
+  ...ADULT_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "\u{1F310} \u843D\u5730\u51FA\u53E3"])
+];
 var q = (a, n = 6) => a.map((x) => " ".repeat(n) + `- "${x}"`).join("\n");
 var p = (a, n = 6) => a.map((x) => " ".repeat(n) + `- ${x}`).join("\n");
 function buildRules() {
@@ -612,8 +658,15 @@ function buildRules() {
     path: ./ruleset/${pn}.list`);
     rules.push(`  - RULE-SET,${pn},${group}`);
   });
+  const head2 = [
+    `  - AND,((NETWORK,UDP),(DST-PORT,443)),\u{1F6AB} QUIC`,
+    `  - DOMAIN-SUFFIX,speed.cloudflare.com,\u{1F680} \u8282\u70B9\u9009\u62E9`
+  ];
+  for (const [type, domain, target] of SENSITIVE_ROUTES) {
+    head2.push(`  - ${type},${domain},${target}`);
+  }
   const ai = AI_DOMAINS.map((d) => `  - DOMAIN-SUFFIX,${d},\u{1F916} AI\u670D\u52A1`);
-  return { prov: prov.join("\n"), rules: [...ai, ...rules].join("\n") };
+  return { prov: prov.join("\n"), rules: [...head2, ...ai, ...rules].join("\n") };
 }
 function head(ipv6) {
   return `mixed-port: 7890
@@ -647,7 +700,11 @@ sniffer:
 dns:
   enable: true
   listen: 0.0.0.0:1053
-  ipv6: ${ipv6}
+  # \u8FD9\u91CC\u6545\u610F\u5199\u6B7B false\uFF0C\u4E0D\u8DDF\u9876\u5C42\u7684 ipv6 \u8D70\uFF1A
+  # fake-ip \u6A21\u5F0F\u4E0B\u5982\u679C\u8FD8\u56DE\u7B54 AAAA\uFF0C\u5BA2\u6237\u7AEF\u4F1A\u4F18\u5148\u62FF IPv6 \u53BB\u8FDE\u76EE\u6807\uFF0C
+  # \u672C\u5730 IPv6 \u51FA\u53E3\u70C2\u7684\u65F6\u5019\u5C31\u662F\u300C\u5EF6\u8FDF\u4E0D\u9AD8\u4F46\u6253\u4E0D\u5F00 / \u7279\u522B\u6162\u300D\u3002
+  # \u9876\u5C42 ipv6 \u4FDD\u6301 true\uFF0C\u662F\u4E3A\u4E86\u8BA9 IPv6 \u63A5\u5165\u70B9\u672C\u8EAB\u8FD8\u80FD\u7528\uFF08\u90A3\u662F\u76F4\u8FDE\u5B57\u9762\u5730\u5740\uFF0C\u4E0D\u8D70 DNS\uFF09\u3002
+  ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
@@ -655,6 +712,14 @@ dns:
     - '+.local'
     - '*.msftconnecttest.com'
     - '*.msftncsi.com'
+    - '+.stun.*.*'
+    - '+.stun.*.*.*'
+    - 'time.*.com'
+    - 'ntp.*.com'
+    - '+.srv.nintendo.net'
+    - '+.stun.playstation.net'
+    - 'xbox.*.microsoft.com'
+    - '+.xboxlive.com'
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
@@ -668,6 +733,39 @@ dns:
       - https://223.5.5.5/dns-query
       - https://1.12.12.12/dns-query
     'geosite:geolocation-!cn':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    # \u4E0B\u9762\u8FD9\u4E9B\u7ECF\u5E38\u88AB\u5730\u7406\u5E93\u8BEF\u5224\u6210\u300C\u56FD\u5185\u300D\uFF0C\u4E00\u65E6\u5224\u6210\u76F4\u8FDE\u5C31\u76F4\u63A5\u6B7B\u4E86\uFF0C
+    # \u663E\u5F0F\u9489\u5230\u5883\u5916 DNS\uFF0C\u7ED5\u5F00\u8BEF\u5224\u3002\u548C\u4E0A\u9762\u7684 inline \u89C4\u5219\u662F\u4E24\u7801\u4E8B\uFF1A
+    # \u8FD9\u91CC\u53EA\u7BA1\u89E3\u6790\uFF0C\u8DEF\u7531\u8D70\u54EA\u6761\u770B rules\u3002
+    '+.google.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.googleapis.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.gstatic.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.gvt1.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.wikipedia.org':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.wikimedia.org':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.openai.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.chatgpt.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.anthropic.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.claude.ai':
       - https://1.1.1.1/dns-query
       - https://8.8.8.8/dns-query`;
 }
@@ -706,6 +804,7 @@ ${p(picks)}
   - name: \u{1F916} AI\u670D\u52A1
     type: select
     proxies:
+      - \u{1F310} \u843D\u5730\u51FA\u53E3
       - \u{1F680} \u8282\u70B9\u9009\u62E9
       - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
       - \u{1F504} \u6545\u969C\u8F6C\u79FB
@@ -829,6 +928,14 @@ ${q(names)}`).join("\n\n");
 ${q(names)}`).join("\n\n");
   const picks = [...locNames, zt ? "ZT\u56E2\u961F\u8FB9\u7F18" : "WARP\u76F4\u8FDE"];
   if (zt) picks.push("WARP\u76F4\u8FDE");
+  const landingPool = [];
+  if (protonNames.length) landingPool.push("Proton\u7EBF\u8DEF");
+  if (windNames.length) landingPool.push("Windscribe\u7EBF\u8DEF");
+  landingPool.push(...locNames);
+  if (zt) landingPool.push("ZT\u56E2\u961F\u8FB9\u7F18");
+  landingPool.push("WARP\u76F4\u8FDE");
+  const aggPool = [...teamEntries, ...v4Entries];
+  picks.push("\u26A1 \u805A\u5408");
   if (protonNames.length) picks.push("Proton\u7EBF\u8DEF", ...protonCCNames);
   if (windNames.length) picks.push("Windscribe\u7EBF\u8DEF", ...windLocNames);
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}\u7EBF\u8DEF
@@ -843,9 +950,11 @@ ${q(tags)}`).join("\n\n");
   - name: ZT\u56E2\u961F\u8FB9\u7F18
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    lazy: true
+    interval: 120
+    tolerance: 30
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${q(teamEntries)}
 ` : "";
@@ -875,6 +984,31 @@ proxies:
 ${proxies.join("\n")}
 
 proxy-groups:
+  - name: \u{1F310} \u843D\u5730\u51FA\u53E3
+    type: select
+    proxies:
+${p(landingPool)}
+      - DIRECT
+
+  # QUIC \u603B\u5F00\u5173\u3002\u9ED8\u8BA4 REJECT\uFF08\u6D4F\u89C8\u5668\u4F1A\u81EA\u52A8\u56DE\u9000 TCP\uFF09\uFF1B
+  # \u4E2A\u522B App \u975E\u7528 QUIC \u4E0D\u53EF\u7684\u8BDD\uFF0C\u5728\u5BA2\u6237\u7AEF\u91CC\u628A\u5B83\u5207\u6210 DIRECT\u3002
+  - name: \u{1F6AB} QUIC
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+
+  # \u5E76\u53D1\u8FDE\u63A5\u5206\u6563\u5230\u591A\u4E2A\u63A5\u5165\u70B9\uFF0C\u5355\u96A7\u9053\u8DD1\u4E0D\u5FEB\u65F6\u7528\u5B83\u3002
+  # \u51FA\u53E3\u662F\u540C\u4E00\u4E2A WARP \u8D26\u53F7\uFF0C\u6240\u4EE5\u4E0D\u5B58\u5728\u4F1A\u8BDD\u5BF9\u4E0D\u4E0A\u7684\u95EE\u9898\u3002
+  - name: \u26A1 \u805A\u5408
+    type: load-balance
+    strategy: consistent-hashing
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 40
+    proxies:
+${q(aggPool)}
+
   - name: \u{1F680} \u8282\u70B9\u9009\u62E9
     type: select
     proxies:
@@ -882,20 +1016,27 @@ proxy-groups:
 ${p(picks)}
       - \u{1F504} \u6545\u969C\u8F6C\u79FB
 
+  # \u539F\u6765\u8FD9\u91CC\u662F url-test \u5957 url-test\uFF08\u6210\u5458\u5168\u662F\u7EC4\uFF09\u3002\u5D4C\u5957\u7EC4\u7684\u5EF6\u8FDF\u53D6\u7684\u662F
+  # \u5B50\u7EC4\u300C\u5F53\u524D\u9009\u4E2D\u8282\u70B9\u300D\u7684\u65E7\u503C\uFF0C\u4E0D\u5237\u65B0\u5C31\u4E00\u76F4\u662F\u65E7\u503C \u2014\u2014 \u8FD9\u5C31\u662F
+  # \u300C\u81EA\u52A8\u9009\u62E9\u6311\u4E0D\u5230\u6700\u5FEB\u300D\u7684\u6839\u56E0\u3002\u644A\u5E73\u6210\u771F\u5B9E\u63A5\u5165\u70B9\uFF0C\u5E76\u5173\u6389 lazy \u8BA9\u5F00\u673A\u5C31\u6D4B\u3002
   - name: \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    lazy: true
+    interval: 180
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
-${p(picks)}
+${q(aggPool)}
 
   - name: \u{1F504} \u6545\u969C\u8F6C\u79FB
     type: fallback
     url: http://www.gstatic.com/generate_204
-    interval: 180
-    lazy: true
+    interval: 120
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${p(picks)}
 
@@ -905,8 +1046,10 @@ ${ztGroupDef}
     type: url-test
     url: http://www.gstatic.com/generate_204
     interval: 300
-    tolerance: 50
-    lazy: true
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${q(entries)}
 ${protonNames.length ? `
@@ -1393,6 +1536,10 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         ${s.zeroTrust ? "<b>ZT\u56E2\u961F\u8FB9\u7F18</b> \u2014 \u8D70 197.x \u56E2\u961F\u8FB9\u7F18\uFF0C\u66F4\u7A33\uFF08Zero Trust \u542F\u7528\u540E\u51FA\u73B0\uFF09\u3002<br>" : ""}
         <b>Proton\u7EBF\u8DEF</b> \u2014 MASQUE \u6253\u5E95 + Proton WireGuard \u843D\u5730\uFF0C10 \u4E2A\u56FD\u5BB6\uFF08\u914D\u7F6E\u540E\u51FA\u73B0\uFF09\u3002<br>
         <b>Windscribe\u7EBF\u8DEF</b> \u2014 MASQUE \u6253\u5E95 + Windscribe \u843D\u5730\uFF0C13 \u4E2A\u5730\u533A\uFF0C\u6709\u9999\u6E2F\uFF08\u914D\u7F6E\u540E\u51FA\u73B0\uFF09\u3002<br>
+        <b>\u{1F310} \u843D\u5730\u51FA\u53E3</b> \u2014 \u51FA\u53E3 IP \u654F\u611F\u7AD9\u70B9\uFF08Play / \u7EF4\u57FA / \u6210\u4EBA\u7AD9 / AI\uFF09\u7684\u4E13\u7528\u51FA\u53E3\uFF0C
+        \u9ED8\u8BA4\u6309\u300C\u80FD\u6362\u51FA\u53E3\u7684\u843D\u5730 \u2192 \u56E2\u961F\u8FB9\u7F18 \u2192 \u514D\u8D39\u8FB9\u7F18\u300D\u6392\u4F18\u5148\u7EA7\u3002<br>
+        <b>\u26A1 \u805A\u5408</b> \u2014 \u5E76\u53D1\u8FDE\u63A5\u5206\u6563\u5230\u591A\u6761\u96A7\u9053\uFF0C\u5355\u96A7\u9053\u8DD1\u4E0D\u5FEB\u65F6\u7528\u3002<br>
+        <b>\u{1F6AB} QUIC</b> \u2014 QUIC \u603B\u5F00\u5173\uFF0C\u9ED8\u8BA4 REJECT\uFF08\u6D4F\u89C8\u5668\u81EA\u52A8\u56DE\u9000 TCP\uFF09\uFF0C\u4E2A\u522B App \u8981\u7528\u5C31\u5207 DIRECT\u3002<br>
         \u5957\u5A03\u7EBF\u8DEF\u8D85\u65F6\u6216\u843D\u5730\u6302\u4E86\uFF0C\u5207${s.zeroTrust ? "ZT\u56E2\u961F\u8FB9\u7F18\u6216" : ""}WARP\u76F4\u8FDE\u9876\u4E0A\u3002
       </div>
       <div id="msg"></div>

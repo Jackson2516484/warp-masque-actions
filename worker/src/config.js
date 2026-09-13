@@ -165,6 +165,41 @@ const AI_DOMAINS = [
   "siliconflow.cn", "dashscope.aliyuncs.com",
 ];
 
+// 出口 IP 敏感的域名。共同点是：目标站会按「是不是机房/VPN IP」拦人，
+// 而 WARP 的出口是 Cloudflare 共享段，被大量站点标成数据中心。
+// 走到 🌐 落地出口 换一次出口（Opera/Proton/Windscribe 的机房），能救回一部分。
+const PLAY_DOMAINS = [
+  // Google Play 本体 + 下载 CDN。下载 CDN 是最常被漏掉的一环：
+  // 商店页面能打开、但装不上 / 更新失败，基本都是 *.gvt1.com / dl.google.com
+  // 没走代理，落到国内直连去了。
+  "play.google.com", "play.googleapis.com", "android.clients.google.com",
+  "dl.google.com", "dl-ssl.google.com",
+  "gvt1.com", "gvt2.com", "gvt3.com",
+  "ggpht.com", "googleusercontent.com",
+];
+
+// 维基媒体。国内直连解析会被污染，必须走代理 + 境外 DNS 一起上。
+const WIKI_DOMAINS = [
+  "wikipedia.org", "wikimedia.org", "wikidata.org", "wikisource.org",
+  "wiktionary.org", "wikibooks.org", "wikinews.org", "wikiversity.org",
+  "wikiquote.org", "mediawiki.org",
+];
+
+// 成人站对 Cloudflare 段的封禁最彻底（直接 403），没有别的办法，只能换出口。
+// 不想要这段就直接删掉这个常量，下面的循环会跟着空转，不影响其他部分。
+const ADULT_DOMAINS = [
+  "pornhub.com", "pornhubpremium.com", "xvideos.com", "xnxx.com",
+  "xhamster.com", "redtube.com", "youporn.com", "spankbang.com",
+  "beeg.com", "eporner.com", "txxx.com", "hqporner.com",
+];
+
+// 域名 -> 分组，拼内联规则用
+const SENSITIVE_ROUTES = [
+  ...PLAY_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "🌐 落地出口"]),
+  ...WIKI_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "🌐 落地出口"]),
+  ...ADULT_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "🌐 落地出口"]),
+];
+
 const q = (a, n = 6) => a.map((x) => " ".repeat(n) + `- "${x}"`).join("\n");
 const p = (a, n = 6) => a.map((x) => " ".repeat(n) + `- ${x}`).join("\n");
 
@@ -182,9 +217,27 @@ function buildRules() {
     path: ./ruleset/${pn}.list`);
     rules.push(`  - RULE-SET,${pn},${group}`);
   });
+
+  // 排在最前面的三条，顺序不能动：
+  //
+  // 1) 关 QUIC。浏览器默认用 QUIC(UDP 443)，在 MASQUE 隧道里等于套了两层 QUIC，
+  //    握手和丢包恢复都被放大，表现就是「Google 系一直转圈」。
+  //    拦掉之后浏览器探测到 QUIC 不通会自动回退 TCP，用户无感。
+  //    哪天某个 App 非要 QUIC，在客户端的 🚫 QUIC 组里切成 DIRECT 即可。
+  // 2) speed.cloudflare.com 钉走代理 —— 本地测速脚本要用它量真实吞吐，
+  //    不能让它落到直连（否则量到的是你自家宽带的速度）。
+  // 3) 出口 IP 敏感的域名（Play / 维基 / 成人站）走 🌐 落地出口。
+  const head = [
+    `  - AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC`,
+    `  - DOMAIN-SUFFIX,speed.cloudflare.com,🚀 节点选择`,
+  ];
+  for (const [type, domain, target] of SENSITIVE_ROUTES) {
+    head.push(`  - ${type},${domain},${target}`);
+  }
+
   // 内联的 AI 域名放在 RULE-SET 前面，别被上游规则集里更宽的条目抢先命中
   const ai = AI_DOMAINS.map((d) => `  - DOMAIN-SUFFIX,${d},🤖 AI服务`);
-  return { prov: prov.join("\n"), rules: [...ai, ...rules].join("\n") };
+  return { prov: prov.join("\n"), rules: [...head, ...ai, ...rules].join("\n") };
 }
 
 /** 公共头部：端口、DNS、sniffer 那一堆。 */
@@ -220,7 +273,11 @@ sniffer:
 dns:
   enable: true
   listen: 0.0.0.0:1053
-  ipv6: ${ipv6}
+  # 这里故意写死 false，不跟顶层的 ipv6 走：
+  # fake-ip 模式下如果还回答 AAAA，客户端会优先拿 IPv6 去连目标，
+  # 本地 IPv6 出口烂的时候就是「延迟不高但打不开 / 特别慢」。
+  # 顶层 ipv6 保持 true，是为了让 IPv6 接入点本身还能用（那是直连字面地址，不走 DNS）。
+  ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
@@ -228,6 +285,14 @@ dns:
     - '+.local'
     - '*.msftconnecttest.com'
     - '*.msftncsi.com'
+    - '+.stun.*.*'
+    - '+.stun.*.*.*'
+    - 'time.*.com'
+    - 'ntp.*.com'
+    - '+.srv.nintendo.net'
+    - '+.stun.playstation.net'
+    - 'xbox.*.microsoft.com'
+    - '+.xboxlive.com'
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
@@ -241,6 +306,39 @@ dns:
       - https://223.5.5.5/dns-query
       - https://1.12.12.12/dns-query
     'geosite:geolocation-!cn':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    # 下面这些经常被地理库误判成「国内」，一旦判成直连就直接死了，
+    # 显式钉到境外 DNS，绕开误判。和上面的 inline 规则是两码事：
+    # 这里只管解析，路由走哪条看 rules。
+    '+.google.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.googleapis.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.gstatic.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.gvt1.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.wikipedia.org':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.wikimedia.org':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.openai.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.chatgpt.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.anthropic.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.claude.ai':
       - https://1.1.1.1/dns-query
       - https://8.8.8.8/dns-query`;
 }
@@ -282,6 +380,7 @@ ${p(picks)}
   - name: 🤖 AI服务
     type: select
     proxies:
+      - 🌐 落地出口
       - 🚀 节点选择
       - ♻️ 自动选择
       - 🔄 故障转移
@@ -439,6 +538,24 @@ ${q(names)}`).join("\n\n");
   const picks = [...locNames, zt ? "ZT团队边缘" : "WARP直连"];
   // Zero Trust 启用时多放一个 WARP直连（免费边缘）作为回退直连选项
   if (zt) picks.push("WARP直连");
+
+  // 出口 IP 敏感站点（Play / 维基 / 成人站 / AI）用的落地池。
+  // 排序即优先级：能换出口的落地（Proton/Windscribe/Opera）排前面，
+  // ZT 团队边缘次之（更稳，但出口还是 Cloudflare，救不了信誉），
+  // 免费边缘直连兜底。只放真实存在的组，不留悬空引用。
+  const landingPool = [];
+  if (protonNames.length) landingPool.push("Proton线路");
+  if (windNames.length) landingPool.push("Windscribe线路");
+  landingPool.push(...locNames);
+  if (zt) landingPool.push("ZT团队边缘");
+  landingPool.push("WARP直连");
+
+  // 聚合池：57 个接入点是同一个 WARP 账号、出口 IP 相同，
+  // 所以把并发连接分散到不同隧道是安全的 —— 单隧道跑不快时用它摊开。
+  // 只收 IPv4 接入点：纯 IPv4 的机器上 IPv6 接入点会 network is unreachable。
+  const aggPool = [...teamEntries, ...v4Entries];
+
+  picks.push("⚡ 聚合");
   if (protonNames.length) picks.push("Proton线路", ...protonCCNames);
   if (windNames.length) picks.push("Windscribe线路", ...windLocNames);
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}线路
@@ -451,14 +568,17 @@ ${q(names)}`).join("\n\n");
 ${q(tags)}`).join("\n\n");
 
   // ZT 团队边缘直连组。只有 Zero Trust 设备才出现：197.x 这批比 198/199
-  // 更稳，是免费号连不上的。开了 lazy，不会一进去就把几个全测一遍。
+  // 更稳，是免费号连不上的。只有 4 个节点，全量测代价可以忽略，
+  // 所以关掉 lazy、间隔压到 120s —— 用户抱怨「ZT 慢」基本都出在选点不准。
   const ztGroupDef = zt ? `
   - name: ZT团队边缘
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    lazy: true
+    interval: 120
+    tolerance: 30
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${q(teamEntries)}
 ` : "";
@@ -490,6 +610,31 @@ proxies:
 ${proxies.join("\n")}
 
 proxy-groups:
+  - name: 🌐 落地出口
+    type: select
+    proxies:
+${p(landingPool)}
+      - DIRECT
+
+  # QUIC 总开关。默认 REJECT（浏览器会自动回退 TCP）；
+  # 个别 App 非用 QUIC 不可的话，在客户端里把它切成 DIRECT。
+  - name: 🚫 QUIC
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+
+  # 并发连接分散到多个接入点，单隧道跑不快时用它。
+  # 出口是同一个 WARP 账号，所以不存在会话对不上的问题。
+  - name: ⚡ 聚合
+    type: load-balance
+    strategy: consistent-hashing
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 40
+    proxies:
+${q(aggPool)}
+
   - name: 🚀 节点选择
     type: select
     proxies:
@@ -497,20 +642,27 @@ proxy-groups:
 ${p(picks)}
       - 🔄 故障转移
 
+  # 原来这里是 url-test 套 url-test（成员全是组）。嵌套组的延迟取的是
+  # 子组「当前选中节点」的旧值，不刷新就一直是旧值 —— 这就是
+  # 「自动选择挑不到最快」的根因。摊平成真实接入点，并关掉 lazy 让开机就测。
   - name: ♻️ 自动选择
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    lazy: true
+    interval: 180
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
-${p(picks)}
+${q(aggPool)}
 
   - name: 🔄 故障转移
     type: fallback
     url: http://www.gstatic.com/generate_204
-    interval: 180
-    lazy: true
+    interval: 120
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${p(picks)}
 
@@ -520,8 +672,10 @@ ${ztGroupDef}
     type: url-test
     url: http://www.gstatic.com/generate_204
     interval: 300
-    tolerance: 50
-    lazy: true
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${q(entries)}
 ${protonNames.length ? `

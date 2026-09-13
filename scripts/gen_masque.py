@@ -88,6 +88,33 @@ AI_DOMAINS = [
     "siliconflow.cn", "dashscope.aliyuncs.com",
 ]
 
+# 出口 IP 敏感的域名。目标站按「是不是机房/VPN IP」拦人，而 WARP 的出口是
+# Cloudflare 共享段。这条流水线是纯 WARP，没有落地可换，只能保证它们
+# **一定走代理**（不再被规则集误判成直连）——要换出口得用 Worker 版的
+# Opera / Proton / Windscribe 落地。与 worker/src/config.js 那份保持一致。
+PLAY_DOMAINS = [
+    # Play 的下载 CDN 是最常漏的一环：商店页面能打开、装不上/更新失败，
+    # 基本都是 *.gvt1.com / dl.google.com 落到国内直连去了。
+    "play.google.com", "play.googleapis.com", "android.clients.google.com",
+    "dl.google.com", "dl-ssl.google.com",
+    "gvt1.com", "gvt2.com", "gvt3.com",
+    "ggpht.com", "googleusercontent.com",
+]
+
+WIKI_DOMAINS = [
+    "wikipedia.org", "wikimedia.org", "wikidata.org", "wikisource.org",
+    "wiktionary.org", "wikibooks.org", "wikinews.org", "wikiversity.org",
+    "wikiquote.org", "mediawiki.org",
+]
+
+# 成人站对 Cloudflare 段的封禁最彻底（直接 403）。纯 WARP 换不了出口，
+# 这几条只是保证走代理。不想要就删掉这个常量。
+ADULT_DOMAINS = [
+    "pornhub.com", "pornhubpremium.com", "xvideos.com", "xnxx.com",
+    "xhamster.com", "redtube.com", "youporn.com", "spankbang.com",
+    "beeg.com", "eporner.com", "txxx.com", "hqporner.com",
+]
+
 
 def pem_to_b64der(pem):
     return "".join(
@@ -183,8 +210,29 @@ def build(cfg):
     path: ./ruleset/{pn}.list""")
         rules.append(f"  - RULE-SET,{pn},{group}")
 
+    # 排最前面的三条，顺序不能动：
+    # 1) 关 QUIC。浏览器默认用 QUIC(UDP 443)，在 MASQUE 隧道里等于套了两层
+    #    QUIC，握手和丢包恢复都被放大，表现就是「Google 系一直转圈」。
+    #    拦掉之后浏览器会自动回退 TCP。要给某个 App 放行就在客户端把
+    #    🚫 QUIC 组切成 DIRECT。
+    # 2) speed.cloudflare.com 钉走代理 —— 本地测速脚本靠它量真实吞吐，
+    #    落到直连就量成自家宽带的速度了。
+    # 3) Play / 维基 / 成人站保证走代理（纯 WARP 换不了出口，只能保证走代理）。
+    head = [
+        "  - AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC",
+        "  - DOMAIN-SUFFIX,speed.cloudflare.com,🚀 节点选择",
+    ]
+    for d in PLAY_DOMAINS + WIKI_DOMAINS + ADULT_DOMAINS:
+        head.append(f"  - DOMAIN-SUFFIX,{d},🚀 节点选择")
+
     # 内联的 AI 域名放在 RULE-SET 前面，别被上游更宽的条目抢先命中
-    rules = [f"  - DOMAIN-SUFFIX,{d},🤖 AI服务" for d in AI_DOMAINS] + rules
+    ai = [f"  - DOMAIN-SUFFIX,{d},🤖 AI服务" for d in AI_DOMAINS]
+    rules = head + ai + rules
+
+    # 聚合池：57 个接入点是同一个 WARP 账号、出口 IP 相同，把并发连接
+    # 分散到不同隧道是安全的；单隧道跑不快时用它摊开。
+    # 只收 IPv4 接入点：纯 IPv4 的机器上 IPv6 接入点会 network is unreachable。
+    agg_pool = [n for n in names if not n.startswith("WARP6-")]
 
     links = masque_links(cfg, priv, pub)
 
@@ -226,7 +274,11 @@ sniffer:
 dns:
   enable: true
   listen: 0.0.0.0:1053
-  ipv6: true
+  # 这里故意写死 false，不跟顶层的 ipv6 走：fake-ip 模式下还回答 AAAA 的话，
+  # 客户端会优先拿 IPv6 去连目标，本地 IPv6 出口烂的时候就是
+  # 「延迟不高但打不开 / 特别慢」。顶层 ipv6 保持 true 是为了让 IPv6
+  # 接入点本身还能用（那是直连字面地址，不走 DNS）。
+  ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
@@ -234,6 +286,14 @@ dns:
     - '+.local'
     - '*.msftconnecttest.com'
     - '*.msftncsi.com'
+    - '+.stun.*.*'
+    - '+.stun.*.*.*'
+    - 'time.*.com'
+    - 'ntp.*.com'
+    - '+.srv.nintendo.net'
+    - '+.stun.playstation.net'
+    - 'xbox.*.microsoft.com'
+    - '+.xboxlive.com'
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
@@ -249,17 +309,68 @@ dns:
     'geosite:geolocation-!cn':
       - https://1.1.1.1/dns-query
       - https://8.8.8.8/dns-query
+    # 下面这些经常被地理库误判成「国内」，一判成直连就直接死了，
+    # 显式钉到境外 DNS。这里只管解析，路由走哪条看 rules。
+    '+.google.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.googleapis.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.gstatic.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.gvt1.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.wikipedia.org':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.wikimedia.org':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.openai.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.chatgpt.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.anthropic.com':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
+    '+.claude.ai':
+      - https://1.1.1.1/dns-query
+      - https://8.8.8.8/dns-query
 
 proxies:
 {chr(10).join(proxies)}
 
 proxy-groups:
+  # QUIC 总开关。默认 REJECT（浏览器会自动回退 TCP）；
+  # 个别 App 非用 QUIC 不可的话，在客户端里把它切成 DIRECT。
+  - name: 🚫 QUIC
+    type: select
+    proxies:
+      - REJECT
+      - DIRECT
+
+  # 并发连接分散到多个接入点。出口是同一个 WARP 账号，不存在会话对不上的问题。
+  - name: ⚡ 聚合
+    type: load-balance
+    strategy: consistent-hashing
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 40
+    proxies:
+{ind(agg_pool)}
+
   - name: 🚀 节点选择
     type: select
     proxies:
       - ♻️ 自动选择
       - 🔄 故障转移
       - ☑️ 手动切换
+      - ⚡ 聚合
       - DIRECT
 
   - name: ☑️ 手动切换
@@ -267,11 +378,16 @@ proxy-groups:
     proxies:
 {ind(names)}
 
+  # 关闭 lazy、间隔压到 180s：用户抱怨「自动选择挑不到最快」基本都是
+  # 三件事叠出来的 —— lazy 让首次使用才测、tolerance 太大不切、间隔太长
+  # 结果过期。这里三个都收紧。
   - name: ♻️ 自动选择
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
+    interval: 180
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
     lazy: false
     proxies:
 {ind(names)}
@@ -279,7 +395,10 @@ proxy-groups:
   - name: 🔄 故障转移
     type: fallback
     url: http://www.gstatic.com/generate_204
-    interval: 180
+    interval: 120
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 {ind(names)}
 
