@@ -300,6 +300,47 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("DNS 关掉 IPv6", /^  ipv6: false$/m.test(dnsBlock));
   t("顶层 IPv6 保留（v6 接入点还要能用）", /^ipv6: true$/m.test(y));
   t("AI 域名钉境外 DNS", dnsBlock.includes("'+.openai.com':"));
+
+  // 🎬 流媒体：4K 视频是持续几十 Mbps 的单条 UDP 流，也是 QoS 最先打击的
+  // 目标；网页是几百个短连接，被压一点感觉不到。拆成独立出口，两条流
+  // 落在不同接入点上互不抢。
+  t("有 🎬 流媒体 组", gs.includes("🎬 流媒体"));
+  t("有 🎬 流媒体自动 组", gs.includes("🎬 流媒体自动"));
+  const stream = y.split("  - name: 🎬 流媒体\n")[1].split("\n  - name:")[0];
+  t("流媒体是 select 组", /type: select/.test(stream));
+  const streamMembers = [...stream.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`流媒体 ${streamMembers.length} 个成员都是真实接入点`,
+    streamMembers.length > 0 && streamMembers.every((m) => entryNames.includes(m)));
+  t("流媒体第一个成员是 ⚡ 聚合", stream.indexOf("- ⚡ 聚合") > 0 &&
+    stream.indexOf("- ⚡ 聚合") < (stream.indexOf('"') > 0 ? stream.indexOf('"') : Infinity));
+  const streamAuto = y.split("  - name: 🎬 流媒体自动")[1].split("\n  - name:")[0];
+  const streamAutoMembers = [...streamAuto.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t("流媒体自动成员都是真实接入点",
+    streamAutoMembers.length > 0 && streamAutoMembers.every((m) => entryNames.includes(m)));
+  t("流媒体自动关掉 lazy", /type: url-test/.test(streamAuto) && /lazy: false/.test(streamAuto));
+
+  // 规则集只盖到 googlevideo/nflx 主域，这些拉流 CDN 全在外面 ——
+  // 漏掉就回落漏网之鱼，跟着默认节点走了
+  const streamMust = ["googlevideo.com", "netflix.com", "nflxvideo.net",
+                      "dssott.com", "aiv-cdn.net", "ttvnw.net", "ibytedtos.com",
+                      "fast.com", "speedtest.net"];
+  const streamMiss = streamMust.filter((d) => !y.includes(`DOMAIN-SUFFIX,${d},🎬 流媒体`));
+  t(`流媒体域名走 🎬 流媒体${streamMiss.length ? " 缺:" + streamMiss : ""}`,
+    streamMiss.length === 0);
+  const streamRule = y.indexOf("  - DOMAIN-SUFFIX,googlevideo.com,🎬 流媒体");
+  t("流媒体规则排在 RULE-SET 前", streamRule > 0 && streamRule < rs);
+
+  // MATCH 必须在 GEOIP,CN 之后。放前面会让所有国内 IP 走不到直连分支，
+  // 全被拽进代理 —— 看视频的带宽先被自己的路由吃掉。
+  const ruleLines = rulesBlock.split("\n").map((l) => l.trim().replace(/^- /, "")).filter(Boolean);
+  t("最后一条是 MATCH", ruleLines[ruleLines.length - 1].startsWith("MATCH,"));
+  const matchIdx = ruleLines.findIndex((l) => l.startsWith("MATCH,"));
+  const cnIdx = ruleLines.findIndex((l) => l.startsWith("GEOIP,CN"));
+  t("MATCH 排在 GEOIP,CN 之后", cnIdx >= 0 && matchIdx > cnIdx);
+
+  const dupRules = ruleLines.filter((l, i) => ruleLines.indexOf(l) !== i);
+  t(`规则无重复${dupRules.length ? " 重复:" + dupRules.slice(0, 3) : ""}`,
+    dupRules.length === 0);
 }
 
 console.log(`\n通过 ${pass} 失败 ${fail}`);

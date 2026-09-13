@@ -193,6 +193,23 @@ const ADULT_DOMAINS = [
   "beeg.com", "eporner.com", "txxx.com", "hqporner.com",
 ];
 
+// 流媒体 / 测速 / 大文件下载 —— 这些是「跑满带宽」的流量，也是唯一会把
+// 单条 MASQUE 隧道（UDP）压到先被 QoS 打击的那条流。单独拆出来，是为了
+// 能把它们和普通网页分开拨到不同的接入点上（见 🎬 流媒体 组）。
+const STREAM_DOMAINS = [
+  // 油管 / 奈飞 / 迪士尼 / 亚马逊 / HBO
+  "googlevideo.com", "youtube.com", "youtu.be", "ytimg.com", "ggpht.com",
+  "netflix.com", "nflxvideo.net", "nflximg.net", "nflxso.net",
+  "disneyplus.com", "dssott.com", "bamgrid.com",
+  "primevideo.com", "aiv-cdn.net", "aiv-delivery.net",
+  "hbomax.com", "max.com",
+  // 音乐 / 直播 / 短视频
+  "spotify.com", "scdn.co", "twitch.tv", "ttvnw.net", "vimeo.com",
+  "vimeocdn.com", "tiktokcdn.com", "tiktokcdn-us.com", "ibytedtos.com",
+  // 测速站点（Fast/Speedtest 是最好用的「隧道真实吞吐」量尺）
+  "fast.com", "speedtest.net",
+];
+
 // 域名 -> 分组，拼内联规则用
 const SENSITIVE_ROUTES = [
   ...PLAY_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "🌐 落地出口"]),
@@ -227,12 +244,19 @@ function buildRules() {
   // 2) speed.cloudflare.com 钉走代理 —— 本地测速脚本要用它量真实吞吐，
   //    不能让它落到直连（否则量到的是你自家宽带的速度）。
   // 3) 出口 IP 敏感的域名（Play / 维基 / 成人站）走 🌐 落地出口。
+  // 4) 流媒体 / 测速域名走 🎬 流媒体，和刷网页的流量分开拨到不同接入点。
+  //    规则集里的 YouTube/Netflix 只盖到主域，Disney+ 的 dssott、
+  //    Prime 的 aiv-cdn、Twitch 的 ttvnw、TikTok 的 ibytedtos 都不在里面 ——
+  //    这些才是 4K 真正拉流的 CDN，漏掉就回落到漏网之鱼了。
   const head = [
     `  - AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC`,
     `  - DOMAIN-SUFFIX,speed.cloudflare.com,🚀 节点选择`,
   ];
   for (const [type, domain, target] of SENSITIVE_ROUTES) {
     head.push(`  - ${type},${domain},${target}`);
+  }
+  for (const d of STREAM_DOMAINS) {
+    head.push(`  - DOMAIN-SUFFIX,${d},🎬 流媒体`);
   }
 
   // 内联的 AI 域名放在 RULE-SET 前面，别被上游规则集里更宽的条目抢先命中
@@ -430,6 +454,7 @@ ${p(picks)}
     type: select
     proxies:
       - 🚀 节点选择
+      - 🎬 流媒体
       - 🎯 全球直连
       - ♻️ 自动选择`;
 }
@@ -632,6 +657,31 @@ ${p(landingPool)}
     url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 40
+    proxies:
+${q(aggPool)}
+
+  # 流媒体 / 测速专用出口。
+  #
+  # 为什么不跟网页共用 🚀 节点选择：4K 视频是持续几十 Mbps 的单条 UDP 流，
+  # 也是运营商 QoS 最先盯上的目标；网页是几百个短连接，被压一点感觉不到。
+  # 拆开之后看视频的流和刷网页的流落在不同接入点上，互不抢。
+  #
+  # 选定后写进 profile.store-selected，重启不丢。
+  - name: 🎬 流媒体
+    type: select
+    proxies:
+      - ⚡ 聚合
+      - DIRECT
+${q(aggPool)}
+
+  - name: 🎬 流媒体自动
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 180
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${q(aggPool)}
 

@@ -321,6 +321,8 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         <b>🌐 落地出口</b> — 出口 IP 敏感站点（Play / 维基 / 成人站 / AI）的专用出口，
         默认按「能换出口的落地 → 团队边缘 → 免费边缘」排优先级。<br>
         <b>⚡ 聚合</b> — 并发连接分散到多条隧道，单隧道跑不快时用。<br>
+        <b>🎬 流媒体</b> — 视频/测速专用出口，和刷网页的流分开拨不同接入点。
+        <b>看 4K 卡就先切这个组换个接入点试</b>；里面第一个成员「⚡ 聚合」是并发最好的选择。<br>
         <b>🚫 QUIC</b> — QUIC 总开关，默认 REJECT（浏览器自动回退 TCP），个别 App 要用就切 DIRECT。<br>
         套娃线路超时或落地挂了，切${s.zeroTrust ? "ZT团队边缘或" : ""}WARP直连顶上。
       </div>

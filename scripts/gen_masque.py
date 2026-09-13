@@ -115,6 +115,23 @@ ADULT_DOMAINS = [
     "beeg.com", "eporner.com", "txxx.com", "hqporner.com",
 ]
 
+# 流媒体 / 测速 / 大文件下载 —— 这些是「跑满带宽」的流量，也是唯一会把
+# 单条 MASQUE 隧道（UDP）压到先被 QoS 打击的那条流。单独拆出来，是为了
+# 能把它们和普通网页分开拨到不同的接入点上（见 🎬 流媒体 组）。
+STREAM_DOMAINS = [
+    # 油管 / 奈飞 / 迪士尼 / 亚马逊 / HBO
+    "googlevideo.com", "youtube.com", "youtu.be", "ytimg.com", "ggpht.com",
+    "netflix.com", "nflxvideo.net", "nflximg.net", "nflxso.net",
+    "disneyplus.com", "dssott.com", "bamgrid.com",
+    "primevideo.com", "aiv-cdn.net", "aiv-delivery.net",
+    "hbomax.com", "max.com",
+    # 音乐 / 直播 / 短视频
+    "spotify.com", "scdn.co", "twitch.tv", "ttvnw.net", "vimeo.com",
+    "vimeocdn.com", "tiktokcdn.com", "tiktokcdn-us.com", "ibytedtos.com",
+    # 测速站点（Fast/Speedtest 是 OFDMA 之外最好用的「隧道真实吞吐」量尺）
+    "fast.com", "speedtest.net",
+]
+
 
 def pem_to_b64der(pem):
     return "".join(
@@ -225,6 +242,14 @@ def build(cfg):
     for d in PLAY_DOMAINS + WIKI_DOMAINS + ADULT_DOMAINS:
         head.append(f"  - DOMAIN-SUFFIX,{d},🚀 节点选择")
 
+    # 流媒体 + 测速：ACL4SSR 的 YouTube/Netflix/ProxyMedia 规则集只盖到
+    # googlevideo/nflx 这几个主域，Disney+ 的 dssott、Prime 的 aiv-cdn、
+    # Twitch 的 ttvnw、TikTok 的 ibytedtos 都不在里面 —— 这些恰恰是
+    # 4K 视频真正拉流的 CDN。漏掉就会回落到 🐟 漏网之鱼，跟着默认节点走。
+    # 内联放在 RULE-SET 前面，保证精确命中优先。
+    for d in STREAM_DOMAINS:
+        head.append(f"  - DOMAIN-SUFFIX,{d},🎬 流媒体")
+
     # 内联的 AI 域名放在 RULE-SET 前面，别被上游更宽的条目抢先命中
     ai = [f"  - DOMAIN-SUFFIX,{d},🤖 AI服务" for d in AI_DOMAINS]
     rules = head + ai + rules
@@ -233,6 +258,8 @@ def build(cfg):
     # 分散到不同隧道是安全的；单隧道跑不快时用它摊开。
     # 只收 IPv4 接入点：纯 IPv4 的机器上 IPv6 接入点会 network is unreachable。
     agg_pool = [n for n in names if not n.startswith("WARP6-")]
+    # 流媒体组的成员池。只有 IPv6 接入点可用时（纯 v6 网络）才轮到 v6。
+    stream_pool = agg_pool or list(names)
 
     links = masque_links(cfg, priv, pub)
 
@@ -364,6 +391,31 @@ proxy-groups:
     proxies:
 {ind(agg_pool)}
 
+  # 流媒体 / 测速专用出口。
+  #
+  # 为什么不跟网页共用 🚀 节点选择：4K 视频是持续几十 Mbps 的单条 UDP 流，
+  # 也是运营商 QoS 最先盯上的目标；而网页是几百个短连接，被压一点感觉不到。
+  # 拆开之后，看视频的流和刷网页的流落在不同接入点上，互不抢。
+  #
+  # 选定后写进 profile.store-selected，重启不丢。
+  - name: 🎬 流媒体
+    type: select
+    proxies:
+      - ⚡ 聚合
+      - DIRECT
+{ind(agg_pool)}
+
+  - name: 🎬 流媒体自动
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 180
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
+    proxies:
+{ind(agg_pool)}
+
   - name: 🚀 节点选择
     type: select
     proxies:
@@ -488,6 +540,7 @@ proxy-groups:
     type: select
     proxies:
       - 🚀 节点选择
+      - 🎬 流媒体
       - 🎯 全球直连
       - ♻️ 自动选择
 
@@ -498,6 +551,8 @@ rules:
 {chr(10).join(rules)}
   - GEOIP,LAN,🎯 全球直连,no-resolve
   - GEOIP,CN,🎯 全球直连
+  # MATCH 必须是最后一条。放 GEOIP 前面会让所有国内 IP 根本走不到直连分支,
+  # 全被拽进代理 —— 看视频的带宽先被自己的路由吃掉了。
   - MATCH,🐟 漏网之鱼
 """, len(names)
 

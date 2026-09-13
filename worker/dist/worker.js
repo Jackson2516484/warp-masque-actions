@@ -1,4 +1,7 @@
-// Opera VPN over Cloudflare WARP (MASQUE) —— 单文件版\n// 由 src/ 打包而成，网页部署用。改代码请改 src/ 后重新 npm run build。\n// 仓库 https://github.com/byJoey/warp-masque-actions\n
+// Opera VPN over Cloudflare WARP (MASQUE) —— 单文件版
+// 由 src/ 打包而成，网页部署用。改代码请改 src/ 后重新 npm run build。
+// 仓库 https://github.com/byJoey/warp-masque-actions
+
 
 // src/warp.js
 var API = "https://api.cloudflareclient.com/v0a4471";
@@ -638,6 +641,39 @@ var ADULT_DOMAINS = [
   "txxx.com",
   "hqporner.com"
 ];
+var STREAM_DOMAINS = [
+  // 油管 / 奈飞 / 迪士尼 / 亚马逊 / HBO
+  "googlevideo.com",
+  "youtube.com",
+  "youtu.be",
+  "ytimg.com",
+  "ggpht.com",
+  "netflix.com",
+  "nflxvideo.net",
+  "nflximg.net",
+  "nflxso.net",
+  "disneyplus.com",
+  "dssott.com",
+  "bamgrid.com",
+  "primevideo.com",
+  "aiv-cdn.net",
+  "aiv-delivery.net",
+  "hbomax.com",
+  "max.com",
+  // 音乐 / 直播 / 短视频
+  "spotify.com",
+  "scdn.co",
+  "twitch.tv",
+  "ttvnw.net",
+  "vimeo.com",
+  "vimeocdn.com",
+  "tiktokcdn.com",
+  "tiktokcdn-us.com",
+  "ibytedtos.com",
+  // 测速站点（Fast/Speedtest 是最好用的「隧道真实吞吐」量尺）
+  "fast.com",
+  "speedtest.net"
+];
 var SENSITIVE_ROUTES = [
   ...PLAY_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "\u{1F310} \u843D\u5730\u51FA\u53E3"]),
   ...WIKI_DOMAINS.map((d) => ["DOMAIN-SUFFIX", d, "\u{1F310} \u843D\u5730\u51FA\u53E3"]),
@@ -664,6 +700,9 @@ function buildRules() {
   ];
   for (const [type, domain, target] of SENSITIVE_ROUTES) {
     head2.push(`  - ${type},${domain},${target}`);
+  }
+  for (const d of STREAM_DOMAINS) {
+    head2.push(`  - DOMAIN-SUFFIX,${d},\u{1F3AC} \u6D41\u5A92\u4F53`);
   }
   const ai = AI_DOMAINS.map((d) => `  - DOMAIN-SUFFIX,${d},\u{1F916} AI\u670D\u52A1`);
   return { prov: prov.join("\n"), rules: [...head2, ...ai, ...rules].join("\n") };
@@ -854,6 +893,7 @@ ${p(picks)}
     type: select
     proxies:
       - \u{1F680} \u8282\u70B9\u9009\u62E9
+      - \u{1F3AC} \u6D41\u5A92\u4F53
       - \u{1F3AF} \u5168\u7403\u76F4\u8FDE
       - \u267B\uFE0F \u81EA\u52A8\u9009\u62E9`;
 }
@@ -1006,6 +1046,31 @@ ${p(landingPool)}
     url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 40
+    proxies:
+${q(aggPool)}
+
+  # \u6D41\u5A92\u4F53 / \u6D4B\u901F\u4E13\u7528\u51FA\u53E3\u3002
+  #
+  # \u4E3A\u4EC0\u4E48\u4E0D\u8DDF\u7F51\u9875\u5171\u7528 \u{1F680} \u8282\u70B9\u9009\u62E9\uFF1A4K \u89C6\u9891\u662F\u6301\u7EED\u51E0\u5341 Mbps \u7684\u5355\u6761 UDP \u6D41\uFF0C
+  # \u4E5F\u662F\u8FD0\u8425\u5546 QoS \u6700\u5148\u76EF\u4E0A\u7684\u76EE\u6807\uFF1B\u7F51\u9875\u662F\u51E0\u767E\u4E2A\u77ED\u8FDE\u63A5\uFF0C\u88AB\u538B\u4E00\u70B9\u611F\u89C9\u4E0D\u5230\u3002
+  # \u62C6\u5F00\u4E4B\u540E\u770B\u89C6\u9891\u7684\u6D41\u548C\u5237\u7F51\u9875\u7684\u6D41\u843D\u5728\u4E0D\u540C\u63A5\u5165\u70B9\u4E0A\uFF0C\u4E92\u4E0D\u62A2\u3002
+  #
+  # \u9009\u5B9A\u540E\u5199\u8FDB profile.store-selected\uFF0C\u91CD\u542F\u4E0D\u4E22\u3002
+  - name: \u{1F3AC} \u6D41\u5A92\u4F53
+    type: select
+    proxies:
+      - \u26A1 \u805A\u5408
+      - DIRECT
+${q(aggPool)}
+
+  - name: \u{1F3AC} \u6D41\u5A92\u4F53\u81EA\u52A8
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 180
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
     proxies:
 ${q(aggPool)}
 
@@ -1539,6 +1604,8 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         <b>\u{1F310} \u843D\u5730\u51FA\u53E3</b> \u2014 \u51FA\u53E3 IP \u654F\u611F\u7AD9\u70B9\uFF08Play / \u7EF4\u57FA / \u6210\u4EBA\u7AD9 / AI\uFF09\u7684\u4E13\u7528\u51FA\u53E3\uFF0C
         \u9ED8\u8BA4\u6309\u300C\u80FD\u6362\u51FA\u53E3\u7684\u843D\u5730 \u2192 \u56E2\u961F\u8FB9\u7F18 \u2192 \u514D\u8D39\u8FB9\u7F18\u300D\u6392\u4F18\u5148\u7EA7\u3002<br>
         <b>\u26A1 \u805A\u5408</b> \u2014 \u5E76\u53D1\u8FDE\u63A5\u5206\u6563\u5230\u591A\u6761\u96A7\u9053\uFF0C\u5355\u96A7\u9053\u8DD1\u4E0D\u5FEB\u65F6\u7528\u3002<br>
+        <b>\u{1F3AC} \u6D41\u5A92\u4F53</b> \u2014 \u89C6\u9891/\u6D4B\u901F\u4E13\u7528\u51FA\u53E3\uFF0C\u548C\u5237\u7F51\u9875\u7684\u6D41\u5206\u5F00\u62E8\u4E0D\u540C\u63A5\u5165\u70B9\u3002
+        <b>\u770B 4K \u5361\u5C31\u5148\u5207\u8FD9\u4E2A\u7EC4\u6362\u4E2A\u63A5\u5165\u70B9\u8BD5</b>\uFF1B\u91CC\u9762\u7B2C\u4E00\u4E2A\u6210\u5458\u300C\u26A1 \u805A\u5408\u300D\u662F\u5E76\u53D1\u6700\u597D\u7684\u9009\u62E9\u3002<br>
         <b>\u{1F6AB} QUIC</b> \u2014 QUIC \u603B\u5F00\u5173\uFF0C\u9ED8\u8BA4 REJECT\uFF08\u6D4F\u89C8\u5668\u81EA\u52A8\u56DE\u9000 TCP\uFF09\uFF0C\u4E2A\u522B App \u8981\u7528\u5C31\u5207 DIRECT\u3002<br>
         \u5957\u5A03\u7EBF\u8DEF\u8D85\u65F6\u6216\u843D\u5730\u6302\u4E86\uFF0C\u5207${s.zeroTrust ? "ZT\u56E2\u961F\u8FB9\u7F18\u6216" : ""}WARP\u76F4\u8FDE\u9876\u4E0A\u3002
       </div>
