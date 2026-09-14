@@ -166,29 +166,88 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("AI服务 能选 WARP直连", ai.includes("WARP直连"));
 }
 
-// Zero Trust 骨干：团队边缘 + 落地走团队边缘
+// Zero Trust 与 consumer WARP 并存：三族节点（免费边缘 / 团队边缘 / 落地）
+// 都要在同一份订阅里活着。
+//
+// 这一块是回归重点。以前的 bug 是 rebuild 里写了
+// `const warp = zt || await getWarp()` —— ZT 设备一上位就把 consumer 那份
+// 整个丢掉，而 config.js 又拿 ZT 的密钥去生成 198/199 那 57 个免费边缘
+// 节点，那些节点在 CF 那边认证不过，客户端里表现就是「只能用 ZT 的」。
 {
-  const ztWarp = { ...warp, zeroTrust: true, accountType: "team" };
-  const r = buildConfig(ztWarp, opera);
-  const y = r.yaml;
+  // 故意用和 consumer 不同的密钥，才能验出「密钥有没有串族」
+  const ztDev = {
+    privateKey: "MGsCAQEEIZTKEY", peerPublicKey: "MFkwEwDZTPUB",
+    ipv4: "172.16.0.9", ipv6: "2606:4700:110::9",
+    deviceId: "z", registeredAt: new Date().toISOString(),
+    zeroTrust: true, accountType: "team",
+  };
+
+  // ---- 只有 ZT（consumer 注册失败时的降级形态）----
+  const solo = buildConfig(null, opera, null, null, ztDev);
+  const gsSolo = [...solo.yaml.matchAll(/^  - name: (.+)$/gm)].map((m) => m[1]);
+  t("ZT 标记为启用", solo.zeroTrust === true);
+  t(`团队边缘 ${solo.teamEdges} 个 (2 IP x 2 端口)`, solo.teamEdges === 4);
+  t("有 ZT团队边缘 组", gsSolo.includes("ZT团队边缘"));
+  t("只有 ZT 时不出 WARP直连 组", !gsSolo.includes("WARP直连"));
+  t("只有 ZT 时不出 ⚡ 聚合WARP 组", !gsSolo.includes("⚡ 聚合WARP"));
+  t(`只有 ZT 时接入点就 ${solo.entries} 个`, solo.entries === 4);
+  // 关键：ZT 密钥绝不能拿去生成免费边缘节点，那 57 个全是死节点
+  t("只有 ZT 时不生成 198/199 节点", !/server: 162\.159\.19[89]/.test(solo.yaml));
+  const selSolo = solo.yaml.split("  - name: 🚀 节点选择")[1].split("\n  - name:")[0];
+  t("只有 ZT 时节点选择不引用 WARP直连", !selSolo.includes("WARP直连"));
+
+  // ---- 兼容老调用：把 ZT 设备当 warp 传 ----
+  const legacy = buildConfig(ztDev, opera);
+  t("ZT 设备当 warp 传也能识别",
+    legacy.zeroTrust === true && legacy.teamEdges === 4 && legacy.entries === 4);
+
+  // ---- 两份并存 ----
+  const proton = {
+    privateKey: "PK", expiresAt: Math.floor(Date.now() / 1000) + 604800,
+    servers: [
+      { name: "日本1", cc: "JP", ip: "1.1.1.1", port: 51820, pub: "A" },
+      { name: "日本2", cc: "JP", ip: "1.1.1.2", port: 51820, pub: "B" },
+      { name: "美国1", cc: "US", ip: "2.2.2.1", port: 51820, pub: "C" },
+    ],
+  };
+  const both = buildConfig(warp, opera, proton, null, ztDev);
+  const y = both.yaml;
   const gs = [...y.matchAll(/^  - name: (.+)$/gm)].map((m) => m[1]);
   const entryNames = [...y.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
+  const nodeBlock = (n) => y.split(`  - name: ${n}\n`)[1].split("\n  - name:")[0];
 
-  t("ZT 标记为启用", r.zeroTrust === true);
-  t(`团队边缘 ${r.teamEdges} 个 (2 IP x 2 端口)`, r.teamEdges === 4);
-  t("有 ZT团队边缘 组", gs.includes("ZT团队边缘"));
+  t(`并存时接入点 ${both.entries} 个 (免费 57 + ZT 4)`, both.entries === 61);
+  t(`免费边缘 ${both.freeEdges} 个`, both.freeEdges === 57);
+  t(`团队边缘 ${both.teamEdges} 个`, both.teamEdges === 4);
+  t(`组合 ${both.combos} 个 (61 x 2)`, both.combos === 122);
+  t("三族的直连组都在",
+    gs.includes("ZT团队边缘") && gs.includes("WARP直连"));
+  t("三个聚合组都在",
+    gs.includes("⚡ 聚合") && gs.includes("⚡ 聚合ZT") && gs.includes("⚡ 聚合WARP"));
+
+  // 密钥不能串族。这是本轮修的核心 bug：
+  // 免费边缘节点必须用 consumer 密钥，团队边缘必须用 ZT 密钥。
+  t("免费边缘节点用 consumer 密钥",
+    nodeBlock("198.1-443").includes(`private-key: ${warp.privateKey}`));
+  t("团队边缘节点用 ZT 密钥",
+    nodeBlock("ZT-197.1-443").includes(`private-key: ${ztDev.privateKey}`));
+  const ztKeyLeak = entryNames.filter((n) => !n.startsWith("ZT-") &&
+    nodeBlock(n).includes(ztDev.privateKey)).length;
+  t(`ZT 密钥只出现在 ZT- 节点上${ztKeyLeak ? " 泄漏 " + ztKeyLeak + " 处" : ""}`,
+    ztKeyLeak === 0);
 
   // 团队边缘节点必须是 197.x + 带 ZT SNI
   const ztEntries = entryNames.filter((n) => n.startsWith("ZT-"));
   t(`ZT- 前缀节点 ${ztEntries.length} 个`, ztEntries.length === 4);
-  const ztNodeBlock = y.split("  - name: ZT-197.1-443")[1].split("\n  - name:")[0];
-  t("团队边缘走 197.x", ztNodeBlock.includes("162.159.197"));
-  t("团队边缘用 zt-masque SNI", ztNodeBlock.includes("zt-masque.cloudflareclient.com"));
+  t("团队边缘走 197.x", nodeBlock("ZT-197.1-443").includes("162.159.197"));
+  t("团队边缘用 zt-masque SNI",
+    nodeBlock("ZT-197.1-443").includes("zt-masque.cloudflareclient.com"));
 
-  // 节点选择里要有 ZT团队边缘，WARP直连 也还在（作回退）
+  // 节点选择里三族都能选到
   const sel = y.split("  - name: 🚀 节点选择")[1].split("\n  - name:")[0];
   t("节点选择含 ZT团队边缘", sel.includes("ZT团队边缘"));
-  t("节点选择仍含 WARP直连", sel.includes("WARP直连"));
+  t("节点选择含 WARP直连", sel.includes("WARP直连"));
+  t("节点选择含地区线路", sel.includes("亚洲线路"));
 
   // ZT团队边缘 组成员都是 ZT- 节点，不能混进免费边缘
   const ztGroup = y.split("  - name: ZT团队边缘")[1].split("\n  - name:")[0];
@@ -197,32 +256,61 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("ZT组成员都是 ZT- 前缀", ztMembers.every((m) => m.startsWith("ZT-")));
   t("ZT组成员都在 proxies 里", ztMembers.every((m) => entryNames.includes(m)));
 
-  // Proton/Windscribe 落地应该走团队边缘（ZT- 前缀接入点）
-  const proton = {
-    privateKey: "PK", expiresAt: Math.floor(Date.now()/1000)+604800,
-    servers: [
-      { name: "日本1", cc: "JP", ip: "1.1.1.1", port: 51820, pub: "A" },
-      { name: "美国1", cc: "US", ip: "2.2.2.1", port: 51820, pub: "C" },
-    ],
-  };
-  const rz = buildConfig(ztWarp, opera, proton);
-  const dps = [...rz.yaml.matchAll(/type: wireguard[\s\S]*?dialer-proxy: (\S+)/g)].map((m) => m[1]);
-  t(`Proton 落地 ${dps.length} 个全走团队边缘`,
-    dps.length === 2 && dps.every((d) => d.startsWith("ZT-")));
+  // WARP直连 组只收免费边缘，不能混进 ZT 节点
+  const wgGroup = y.split("  - name: WARP直连")[1].split("\n  - name:")[0];
+  const wgMembers = [...wgGroup.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`WARP直连 ${wgMembers.length} 个成员全是免费边缘`,
+    wgMembers.length === 57 && wgMembers.every((m) => !m.startsWith("ZT-")));
+
+  // 落地首跳必须横跨两族：任何一族整体挂掉时，另一半落地照样能用。
+  // 以前是 dialerPool = teamEntries，全部落地压在 ZT 那 4 个上。
+  const pdp = [...y.matchAll(/type: wireguard[\s\S]*?dialer-proxy: (\S+)/g)].map((m) => m[1]);
+  t(`Proton 首跳 ${pdp.length} 个`, pdp.length === 3);
+  t("Proton 首跳全是 IPv4 接入点",
+    pdp.every((d) => !d.startsWith("v6-") && entryNames.includes(d)));
+  t("Proton 首跳跨两族（不是全压在 ZT 上）",
+    pdp.some((d) => d.startsWith("ZT-")) && pdp.some((d) => !d.startsWith("ZT-")));
+  t("首跳按 ZT/免费 交错",
+    pdp[0].startsWith("ZT-") && !pdp[1].startsWith("ZT-") && pdp[2].startsWith("ZT-"));
+
+  // 只有 ZT 时落地也必须有首跳，不能配出 dialer-proxy 悬空的节点
+  const soloPdp = [...solo.yaml.matchAll(/type: wireguard[\s\S]*?dialer-proxy: (\S+)/g)];
+  t("只有 ZT 时落地首跳不为空（没有 Proton 就没有）", soloPdp.length === 0);
+  const soloWarp = buildConfig(null, opera, proton, null, ztDev);
+  const soloPdp2 = [...soloWarp.yaml.matchAll(/type: wireguard[\s\S]*?dialer-proxy: (\S+)/g)].map((m) => m[1]);
+  t(`只有 ZT 时 Proton 首跳 ${soloPdp2.length} 个全走团队边缘`,
+    soloPdp2.length === 3 && soloPdp2.every((d) => d.startsWith("ZT-")));
+
+  // 聚合组只收 IPv4 接入点，混进 v6 在纯 IPv4 机器上会 network is unreachable
+  const agg = y.split("  - name: ⚡ 聚合\n")[1].split("\n  - name:")[0];
+  const aggM = [...agg.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`聚合 ${aggM.length} 个成员 = 免费29 + ZT4`,
+    aggM.length === 33 && aggM.every((m) => !m.startsWith("v6-") && entryNames.includes(m)));
+  const aggZt = y.split("  - name: ⚡ 聚合ZT\n")[1].split("\n  - name:")[0];
+  const aggZtM = [...aggZt.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t("⚡ 聚合ZT 只收 ZT 节点", aggZtM.length === 4 && aggZtM.every((m) => m.startsWith("ZT-")));
+  const aggWarp = y.split("  - name: ⚡ 聚合WARP\n")[1].split("\n  - name:")[0];
+  const aggWarpM = [...aggWarp.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`⚡ 聚合WARP 只收免费边缘 ${aggWarpM.length} 个`,
+    aggWarpM.length === 29 && aggWarpM.every((m) => !m.startsWith("ZT-")));
+
+  // 流媒体组要能一键切到单族聚合（定位「到底哪一族慢」）
+  const stream = y.split("  - name: 🎬 流媒体\n")[1].split("\n  - name:")[0];
+  t("流媒体能选 ⚡ 聚合ZT", stream.includes("- ⚡ 聚合ZT"));
+  t("流媒体能选 ⚡ 聚合WARP", stream.includes("- ⚡ 聚合WARP"));
 
   // 悬空引用（含 ZT + Proton 分组）。groups 要从同一份配置取，不能拿
   // 没 Proton 那份的 gs 来对，否则 Proton线路/Proton-日本 这些会被误判悬空。
   // 所有 `  - name:` 行都要算进 defined：组定义 + 块式代理定义（Proton 的
   // `name: "日本1"` 带引号，refs 里成员行去掉引号，两边要统一才能对上）。
-  const gs2 = [...rz.yaml.matchAll(/^  - name: (.+)$/gm)]
+  const gs2 = [...y.matchAll(/^  - name: (.+)$/gm)]
     .map((m) => m[1].replace(/^"(.+)"$/, "$1"));
-  const gsec = rz.yaml.slice(rz.yaml.indexOf("proxy-groups:"), rz.yaml.indexOf("rule-providers:"));
+  const gsec = y.slice(y.indexOf("proxy-groups:"), y.indexOf("rule-providers:"));
   const refs = [...gsec.matchAll(/^      - "?([^"\n]+)"?$/gm)].map((m) => m[1].trim());
-  const names = [...rz.yaml.matchAll(/^  - \{name: "([^"]+)"/gm)].map((m) => m[1]);
-  const ents = [...rz.yaml.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
-  const def = new Set([...gs2, ...names, ...ents, "DIRECT", "REJECT"]);
+  const names = [...y.matchAll(/^  - \{name: "([^"]+)"/gm)].map((m) => m[1]);
+  const def = new Set([...gs2, ...names, ...entryNames, "DIRECT", "REJECT"]);
   const dang = [...new Set(refs.filter((r) => !def.has(r)))];
-  t(`ZT 配置无悬空引用${dang.length ? " (" + dang.slice(0, 3) + ")" : ""}`, dang.length === 0);
+  t(`并存配置无悬空引用${dang.length ? " (" + dang.slice(0, 3) + ")" : ""}`, dang.length === 0);
 
   // consumer WARP（不传 zeroTrust）绝不能冒出团队边缘。
   // 只看真正的节点定义（server: 162.159.197），不看注释里的说明文字。
@@ -231,6 +319,13 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("免费 WARP 不该有 197.x 节点定义",
     !/server: 162\.159\.197/.test(consumer.yaml));
   t("免费 WARP 标记 ZT 关", consumer.zeroTrust === false && consumer.teamEdges === 0);
+  t(`免费 WARP 接入点 ${consumer.entries} 个`, consumer.entries === 57);
+  t("免费 WARP 不该有 ⚡ 聚合ZT 组", !consumer.yaml.includes("⚡ 聚合ZT"));
+
+  // 两份设备都缺时必须明确报错，不能返回一份没有代理的配置
+  let threw = false;
+  try { buildConfig(null, opera, null, null, null); } catch { threw = true; }
+  t("两份设备都缺时报错", threw);
 }
 
 // 调优项：关 QUIC / 出口 IP 敏感域名 / 自动选择不再套娃 / DNS 不吃 AAAA

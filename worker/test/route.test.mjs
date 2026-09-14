@@ -364,16 +364,32 @@ t("新密码能登上",
   // mock CF API。POST /reg 看 JWT 值决定回 team 还是 free：
   // 「好 JWT」回 team（注册成功），别的 JWT 回 free（模拟过期/未生效，
   // registerWarp 必须拒掉，不能把降级号当 ZT 用）。
-  // PATCH /reg/<id> 回 MASQUE enroll 结果。别的地址（Opera 等）一律 500，
-  // rebuild 会失败但设备该已写入 KV —— 跟 Proton 推送那条测试一个思路。
+  // PATCH /reg/<id> 回 MASQUE enroll 结果。
+  //
+  // Opera 也一起 mock 掉：rebuild 现在会**同时**确保 consumer 免费设备存在
+  // （两份设备并存），所以它除了打 CF API 还会打 Opera。Opera 通了 rebuild
+  // 才能走完，下面 reset-warp 那条才测得到「真的重注册成功了」。
   const GOOD_JWT = "fake.jwt.team.token.value.long.enough.to.pass.length.check";
   const realFetch = globalThis.fetch;
-  let sawJwtHeader = "";
+  // /reg 会被打两次：一次带 JWT 的 ZT 注册、一次不带 JWT 的 consumer 注册。
+  // 不能只留最后一个（会被 consumer 那次覆盖成空串），要全记下来。
+  const regJwts = [];
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url), m = init.method || "GET";
+    if (u.includes("api2.sec-tunnel.com")) {
+      const path = u.split("/v4/")[1] || "";
+      const data = path === "register_device" ? { device_id: "dev-1" }
+        : path === "device_generate_password" ? { device_password: "pw" }
+        : path === "discover" ? { ips: [{ ip: "77.111.245.1", port: [443] }] }
+        : {};
+      // status.code=0 才不被 rpc 当错误抛掉
+      return new Response(JSON.stringify({ status: { code: 0 }, data }),
+        { status: 200, headers: { "content-type": "application/json" } });
+    }
     if (u.includes("api.cloudflareclient.com") && u.endsWith("/reg") && m === "POST") {
-      sawJwtHeader = init.headers?.["Cf-Access-Jwt-Assertion"] || "";
-      const isTeam = sawJwtHeader === GOOD_JWT;
+      const h = init.headers?.["Cf-Access-Jwt-Assertion"] || "";
+      regJwts.push(h);
+      const isTeam = h === GOOD_JWT;
       return new Response(JSON.stringify({
         id: "dev-abc", token: "tok-abc",
         account: { account_type: isTeam ? "team" : "free" },
@@ -403,29 +419,58 @@ t("新密码能登上",
     { jwt: GOOD_JWT }, az), env);
   const gj = await good.json();
   t("team 注册返回 ok", good.status === 200 && gj.ok);
-  t("JWT 走了 Cf-Access-Jwt-Assertion 头", sawJwtHeader === GOOD_JWT);
+  t("JWT 走了 Cf-Access-Jwt-Assertion 头", regJwts.includes(GOOD_JWT));
+  // 只有 ZT 那一次带 GOOD_JWT。consumer 免费设备是独立账号，注册时绝不能
+  // 带团队 JWT，否则免费设备也注册到团队下，两族就串了。
+  t("consumer 注册不带 JWT（只有 ZT 那次带）",
+    regJwts.filter((h) => h === GOOD_JWT).length === 1 &&
+    regJwts.filter((h) => !h).length >= 1);
   t("ZT 设备已落 KV", !!kv.get("zt:device"));
+  // 关键：ZT 注册不该把 consumer 那份挤掉，两份必须并存 ——
+  // 这正是「只能用一个（只能用 zt 的）」那个 bug 的防线。
+  t("consumer WARP 设备也在 KV 里（两份并存）", !!kv.get("warp:device"));
   const dev = JSON.parse(kv.get("zt:device"));
   t("设备标记 zeroTrust=true", dev.zeroTrust === true);
   t("设备 accountType 是 team", dev.accountType === "team");
   t("设备有 deviceId", dev.deviceId === "dev-abc");
   t("设备有 MASQUE 私钥", !!dev.privateKey);
   t("设备有内网地址", dev.ipv4 === "172.16.0.2");
+  t("consumer 设备没被标成 zeroTrust",
+    JSON.parse(kv.get("warp:device")).zeroTrust === false);
 
-  globalThis.fetch = realFetch;
+  // 状态页要能同时看到两份设备，否则用户没法判断哪一族还在
+  const st = await (await worker.fetch(req("/api/state", { headers: az }), env)).json();
+  t("state 同时上报两份设备", !!st.warp && !!st.zt);
+  t("state.zt 是 team 设备", st.zt.accountType === "team");
+  t("state 标记 ZT 已启用", st.zeroTrust === true);
+  t(`state 统计免费边缘 ${st.stats.freeEdges} + 团队边缘 ${st.stats.teamEdges}`,
+    st.stats.freeEdges === 57 && st.stats.teamEdges === 4);
+  t(`state 接入点总数 ${st.stats.entries}`, st.stats.entries === 61);
 
-  // 清除
+  // 清除只摘团队边缘那一族，免费 WARP 那份不能跟着掉
   const clr = await worker.fetch(post("/api/zt/clear", {}, az), env);
   t("清除 ZT 返回 ok", clr.status === 200 && (await clr.json()).ok);
   t("清除后 KV 无 ZT 设备", !kv.get("zt:device"));
+  t("清除 ZT 不动免费 WARP 设备", !!kv.get("warp:device"));
 
-  // reset-warp 在 ZT 启用时应引导用户先清除（不能静默重注册 ZT）
-  // 重新塞回一个 ZT 设备测这条
+  // reset-warp：两份设备并存之后不再需要「先清 ZT」，它只重注册免费那份
   kv.set("zt:device", JSON.stringify({ ...dev }));
   const rw = await worker.fetch(post("/api/reset-warp", {}, az), env);
   const rwj = await rw.json();
-  t("ZT 启用时 reset-warp 拒绝并引导",
-    !rwj.ok && rwj.error.includes("Zero Trust"));
+  t("ZT 在时 reset-warp 照样能用", rw.status === 200 && rwj.ok);
+  t("reset-warp 只动免费那份，ZT 设备原样保留",
+    !!kv.get("zt:device") &&
+    JSON.parse(kv.get("zt:device")).deviceId === "dev-abc");
+
+  // 状态页要能把「两族并存」讲清楚，否则用户还是会以为只能用一个
+  const uiRes = await worker.fetch(req("/", { headers: az }), env);
+  const ui = await uiRes.text();
+  t("状态页渲染成功", uiRes.status === 200 && ui.includes("OPERA // MASQUE"));
+  t("状态页显示两份设备", ui.includes("免费 WARP 设备") && ui.includes("ZT 团队设备"));
+  t("状态页说明两族并存", ui.includes("两份设备并存") && ui.includes("并存，不是二选一"));
+  t("状态页列出免费边缘节点数", ui.includes("免费边缘节点"));
+
+  globalThis.fetch = realFetch;
 }
 
 // ---- Zero Trust 设备由流水线推送 ----

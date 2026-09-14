@@ -73,17 +73,40 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
     dns: [1.1.1.1, 2606:4700:4700::1111]`;
 }
 
-/** 生成全部 MASQUE 接入点。两种配置都用这批。
+/** 生成一台设备能用的全部 MASQUE 接入点。
  *
- * zeroTrust 为真时（设备是 Zero Trust 注册的）会额外吐一批团队边缘
- * 节点（162.159.197.x + zt-masque SNI），单独收在 teamEntries 里。
- * 团队边缘免费号连不上，所以只在 ZT 设备启用时才放出来。 */
-function buildEntries(warp) {
-  const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = warp;
-  const entries = [], proxies = [];
+ * 两套密钥在 CF 那边是分开认证的，谁也不能顶替谁：
+ *   consumer 设备     -> 免费边缘 162.159.198/199.x（外加官方域名 SNI 节点）
+ *   Zero Trust 设备   -> 团队边缘 162.159.197.x（zt-masque SNI）
+ *
+ * 免费号喂 197.x 会 login 失败；反过来把 198/199 喂给团队号同样认不过。
+ * 所以这里按 zeroTrust 标志「只出自己那一套」。
+ *
+ * 以前的写法是无条件先把 198/199 那 57 个生成出来，再在 ZT 设备上追加
+ * 团队边缘 —— 结果 ZT 一上位，那 57 个节点全部变成永远超时的死节点，
+ * 客户端里表现就是「只有 ZT 能用、别的全连不上」。 */
+function buildEntries(dev) {
+  const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = dev;
   // v4Entries 单独留一份：做 dialer-proxy 目标时只能用 IPv4，
   // 否则纯 IPv4 的机器上会直接 "network is unreachable"。
-  const v4Entries = [];
+  const entries = [], v4Entries = [], proxies = [];
+
+  // 团队边缘。节点名带 "ZT-" 前缀，客户端里一眼能分清是哪一族。
+  if (zeroTrust) {
+    for (const ip of TEAM_V4) {
+      for (const port of TEAM_PORTS) {
+        const n = `ZT-${entryName(ip, port)}`;
+        entries.push(n);
+        v4Entries.push(n);
+        proxies.push(masqueNode(n, ip, port, priv, pub, v4, v6, ZT_SNI));
+      }
+    }
+    return { entries, proxies, v4Entries,
+             teamEntries: [...entries], teamProxies: [...proxies] };
+  }
+
+  // 免费边缘。57 个接入点是真机握手实测筛过的，别往回加
+  // 162.159.194/196/197/204 和 v6 的 102/105 段 —— 它们回 QUIC 包但 login 失败。
   for (const ip of [...V4, ...V6]) {
     for (const port of PORTS) {
       const n = entryName(ip, port);
@@ -96,20 +119,7 @@ function buildEntries(warp) {
   v4Entries.push("官方域名");   // 官方域名节点本身连的是 IPv4
   proxies.push(masqueNode("官方域名", SNI_NODE[0], SNI_NODE[1],
                           priv, pub, v4, v6, OFFICIAL_SNI));
-
-  // 团队边缘：只在 Zero Trust 设备启用时才有。这批是 ZT 专属，免费号
-  // 喂进去 login 失败。节点名带 "ZT-" 前缀好让客户端一眼分清。
-  const teamEntries = [], teamProxies = [];
-  if (zeroTrust) {
-    for (const ip of TEAM_V4) {
-      for (const port of TEAM_PORTS) {
-        const n = `ZT-${entryName(ip, port)}`;
-        teamEntries.push(n);
-        teamProxies.push(masqueNode(n, ip, port, priv, pub, v4, v6, ZT_SNI));
-      }
-    }
-  }
-  return { entries, proxies, v4Entries, teamEntries, teamProxies };
+  return { entries, proxies, v4Entries, teamEntries: [], teamProxies: [] };
 }
 
 // 规则集只盖到 OpenAI / Claude / Gemini / Copilot，其他家没人维护。
@@ -219,6 +229,22 @@ const SENSITIVE_ROUTES = [
 
 const q = (a, n = 6) => a.map((x) => " ".repeat(n) + `- "${x}"`).join("\n");
 const p = (a, n = 6) => a.map((x) => " ".repeat(n) + `- ${x}`).join("\n");
+
+/** 两个池子交错合并：[a0, b0, a1, b1, ...]。
+ *
+ * 落地族的首跳（dialer-proxy）按这个顺序轮着分。交错的目的是让
+ * 「免费边缘」和「ZT 团队边缘」两族各承担一半落地 —— 任何一族整体
+ * 挂掉（比如团队边缘被 Gateway 策略掐了、或者免费边缘被 QoS 打崩），
+ * 另一半的落地照样能用，不会一次全死。 */
+function interleave(a, b) {
+  const out = [];
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (i < a.length) out.push(a[i]);
+    if (i < b.length) out.push(b[i]);
+  }
+  return out;
+}
 
 /** rule-providers 和 rules，两种配置共用。 */
 function buildRules() {
@@ -459,26 +485,54 @@ ${p(picks)}
       - ♻️ 自动选择`;
 }
 
-export function buildConfig(warp, opera, proton, wind) {
-  const { entries, proxies, v4Entries, teamEntries, teamProxies } = buildEntries(warp);
-  const zt = !!warp.zeroTrust && teamEntries.length > 0;
+/** 生成 mihomo 配置。
+ *
+ * warp —— consumer 免费 WARP 设备（免费边缘 198/199）
+ * ztDevice —— Zero Trust 团队设备（团队边缘 197.x），可选
+ *
+ * 两份设备是**并存**的，不是二选一：各自的密钥只能认证自己那套边缘，
+ * 所以三族节点（WARP免费边缘 / ZT团队边缘 / Proton-Windscribe-Opera 落地）
+ * 都能在同一份订阅里活着、都能单独选。以前是 zt 一有就把 warp 丢掉，
+ * 结果免费边缘那 57 个节点全废，只剩 ZT 那 4 个能用。
+ *
+ * 兼容老调用：只传一份 ZT 设备当 warp 时，自动归到 ZT 那一路。
+ */
+export function buildConfig(warp, opera, proton, wind, ztDevice = null) {
+  let freeDev = warp, ztDev = ztDevice;
+  if (warp && warp.zeroTrust) { ztDev = warp; freeDev = null; }
 
-  // Zero Trust 启用时，团队边缘节点也要进 proxies 池。
-  // 放在免费边缘后面，客户端按组用，互不影响。
-  if (zt) proxies.push(...teamProxies);
+  const free = freeDev ? buildEntries(freeDev) : null;
+  const zteam = ztDev ? buildEntries(ztDev) : null;
 
-  // 嵌套落地（选国家那条）走哪个接入点池：Zero Trust 时优先走团队边缘
-  // （更稳），没有才用免费 v4。WireGuard/HTTPS 的 UDP 都得经这个接入点
-  // 发出去，分到 IPv6 会让纯 IPv4 的机器 network is unreachable。
-  const dialerPool = zt ? teamEntries : v4Entries;
-  const dialerFallback = v4Entries;   // 团队边缘全挂时兜底，避免 0 个可用
+  const freeEntries = free ? free.entries : [];
+  const freeV4 = free ? free.v4Entries : [];
+  const teamEntries = zteam ? zteam.teamEntries : [];
+  const zt = teamEntries.length > 0;
+
+  // 两族接入点各用各的密钥，一起进 proxies 池，谁也别顶替谁
+  const proxies = [];
+  if (free) proxies.push(...free.proxies);
+  if (zteam) proxies.push(...zteam.proxies);
+
+  // 全部接入点（含 IPv6）：Opera 的笛卡尔积要的是回退面最广
+  const frontAll = [...freeEntries, ...teamEntries];
+  // 只有 IPv4 的接入点：WireGuard 的 UDP 和 load-balance 都必须走这个
+  const frontV4 = [...freeV4, ...teamEntries];
+  if (!frontAll.length) {
+    throw new Error("没有可用的 MASQUE 接入点：consumer WARP 和 Zero Trust 设备都缺失");
+  }
+
+  // 落地族的首跳（dialer-proxy）池。ZT 那 4 个比免费边缘稳，但不该让全部
+  // 落地都压在同一族 —— 交错开，任何一族整体挂掉时另一半落地照样能用。
+  // 只收 IPv4：WireGuard/HTTPS 的 UDP 经 IPv6 接入点发出去，在纯 IPv4
+  // 的机器上是 network is unreachable。
+  const dialerPool = zt ? interleave(teamEntries, freeV4) : freeV4;
 
   // 笛卡尔积：任一接入点或任一落地失效，其他组合仍可用。
-  // Opera 走的是免费边缘全集（要的是尽可能多的回退组合），不切团队边缘：
-  // 团队边缘只有 4 个，做笛卡尔积回退面太窄；它另开一个直连组走稳定线路。
+  // Opera 用 frontAll（免费 + 团队两族全集），要的就是回退组合尽量多。
   const byLoc = {};
   for (const land of opera.landings) {
-    for (const ent of entries) {
+    for (const ent of frontAll) {
       const name = `${land.tag}@${ent}`;
       (byLoc[land.loc] ||= []).push(name);
       proxies.push(
@@ -489,15 +543,15 @@ export function buildConfig(warp, opera, proton, wind) {
   }
   const combos = Object.values(byLoc).reduce((a, b) => a + b.length, 0);
 
-  // Proton 落地。28 台 x 41 接入点会爆到上千节点，没必要，
-  // 每台轮着分一个接入点即可，接入点挂了还有其他 Proton 节点顶。
-  // Zero Trust 启用时优先分团队边缘（更稳），团队边缘全没就回退免费 v4。
+  // Proton 落地。28 台 x 61 接入点会爆到上千节点，没必要，
+  // 每台轮着分一个接入点即可（dialerPool 是两族交错的），
+  // 接入点挂了还有其他 Proton 节点顶。
   let protonNames = [];
   const protonByCC = {};   // 国家 -> 该国节点名，用来按国家分组
   if (proton && proton.servers && proton.servers.length) {
     proton.servers.forEach((srv, i) => {
       const ent = dialerPool[i % dialerPool.length] ||
-                  dialerFallback[i % dialerFallback.length];
+                  frontV4[i % frontV4.length];
       protonNames.push(srv.name);
       // 节点名形如「日本1」，去掉尾号就是国家名
       const cc = srv.name.replace(/\d+$/, "");
@@ -517,13 +571,12 @@ export function buildConfig(warp, opera, proton, wind) {
 
   // Windscribe 落地。和 Opera 同构（HTTPS 代理 + Basic），
   // 但免费额度只有 2GB/月，做笛卡尔积没意义 —— 每台轮一个接入点就够。
-  // 同样优先团队边缘（Zero Trust 启用时），理由同 Proton。
   const windNames = [];
   const windByLoc = {};
   if (wind && wind.servers && wind.servers.length) {
     wind.servers.forEach((srv, i) => {
       const ent = dialerPool[i % dialerPool.length] ||
-                  dialerFallback[i % dialerFallback.length];
+                  frontV4[i % frontV4.length];
       const name = `WS-${srv.tag}`;
       windNames.push(name);
       (windByLoc[srv.loc] = windByLoc[srv.loc] || []).push(name);
@@ -560,29 +613,40 @@ ${q(names)}`).join("\n\n");
     proxies:
 ${q(names)}`).join("\n\n");
 
-  const picks = [...locNames, zt ? "ZT团队边缘" : "WARP直连"];
-  // Zero Trust 启用时多放一个 WARP直连（免费边缘）作为回退直连选项
-  if (zt) picks.push("WARP直连");
-
   // 出口 IP 敏感站点（Play / 维基 / 成人站 / AI）用的落地池。
   // 排序即优先级：能换出口的落地（Proton/Windscribe/Opera）排前面，
   // ZT 团队边缘次之（更稳，但出口还是 Cloudflare，救不了信誉），
-  // 免费边缘直连兜底。只放真实存在的组，不留悬空引用。
+  // 免费边缘直连兜底。只放真实存在的组，不留悬空引用 ——
+  // 少一份设备就少一族，绝不能引用不存在的组（内核会直接加载失败）。
   const landingPool = [];
   if (protonNames.length) landingPool.push("Proton线路");
   if (windNames.length) landingPool.push("Windscribe线路");
   landingPool.push(...locNames);
   if (zt) landingPool.push("ZT团队边缘");
-  landingPool.push("WARP直连");
+  if (freeEntries.length) landingPool.push("WARP直连");
 
-  // 聚合池：57 个接入点是同一个 WARP 账号、出口 IP 相同，
-  // 所以把并发连接分散到不同隧道是安全的 —— 单隧道跑不快时用它摊开。
-  // 只收 IPv4 接入点：纯 IPv4 的机器上 IPv6 接入点会 network is unreachable。
-  const aggPool = [...teamEntries, ...v4Entries];
-
+  // 一键开关。三族节点都在这一份订阅里，用户要能按族隔离排查：
+  // 「是不是只有某一族能用」这个问题，切开一看组内延迟就清楚了。
+  const picks = [...locNames];
+  if (zt) picks.push("ZT团队边缘");
+  if (freeEntries.length) picks.push("WARP直连");
   picks.push("⚡ 聚合");
+  if (zt) picks.push("⚡ 聚合ZT");
+  if (freeV4.length) picks.push("⚡ 聚合WARP");
   if (protonNames.length) picks.push("Proton线路", ...protonCCNames);
   if (windNames.length) picks.push("Windscribe线路", ...windLocNames);
+
+  // 聚合池：把并发连接分散到多条隧道，单隧道跑不快时用它摊开。
+  // 只收 IPv4 接入点 —— 纯 IPv4 的机器上 IPv6 接入点会 network is unreachable。
+  //
+  // 注意这里混了两族（两个不同的 WARP 账号，出口 IP 不同）。load-balance
+  // 用的是 consistent-hashing，按目标域名散，同一个站点始终落在同一条
+  // 隧道上，所以不会出现「一个会话中途换出口」。要出口绝对统一就用
+  // 下面那两个单族子池（⚡ 聚合WARP / ⚡ 聚合ZT）。
+  const aggPool = frontV4;
+  const ztAggPool = teamEntries;
+  const freeAggPool = freeV4;
+
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}线路
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -608,23 +672,68 @@ ${q(tags)}`).join("\n\n");
 ${q(teamEntries)}
 ` : "";
 
+  // 单族聚合子池。两族混着放（⚡ 聚合）出口 IP 会不一样，虽然
+  // consistent-hashing 按目标域名散、不会中途换出口，但要出口严格统一、
+  // 或者想定位「到底哪一族慢」时，用这两个单族池。
+  const ztAggDef = zt ? `
+  - name: ⚡ 聚合ZT
+    type: load-balance
+    strategy: consistent-hashing
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 40
+    proxies:
+${q(ztAggPool)}
+` : "";
+  const freeAggDef = freeV4.length ? `
+  - name: ⚡ 聚合WARP
+    type: load-balance
+    strategy: consistent-hashing
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 40
+    proxies:
+${q(freeAggPool)}
+` : "";
+
+  // 免费边缘直连组。没有 consumer 设备时整组不出现 —— 组可以少，
+  // 但绝不能引用不存在的组（内核加载会直接失败）。
+  const warpGroupDef = freeEntries.length ? `
+  - name: WARP直连
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 40
+    timeout: 3000
+    max-failed-times: 2
+    lazy: false
+    proxies:
+${q(freeEntries)}
+` : "";
+
+  // 流媒体组的可选出口：聚合 + 两个单族聚合，按存在的出
+  const streamExtra =
+    (zt ? "      - ⚡ 聚合ZT\n" : "") +
+    (freeV4.length ? "      - ⚡ 聚合WARP\n" : "");
+
   const { prov, rules } = buildRules();
 
   const yaml = `# Opera VPN over Cloudflare WARP (MASQUE)
 # 由 Cloudflare Worker 生成于 ${new Date().toISOString()}
 #
-# 聚合版：套娃线路和 WARP 直连都在这一份里。
+# 聚合版：三族节点都在这一份里，各用各的密钥，互不顶替。
 #
 #   亚洲/欧洲/美洲线路  本机 -> MASQUE -> Opera 落地 -> 目标（能换出口国家）
-#   WARP直连            本机 -> MASQUE -> 目标（出口是 CF 自己的 IP，快）
+#   Proton/Windscribe   本机 -> MASQUE -> 对应落地 -> 目标（能换出口国家）
+#   WARP直连            本机 -> MASQUE(免费边缘 198/199) -> 目标（出口是 CF 的 IP，快）
 ${zt ? `#   ZT团队边缘         本机 -> MASQUE(团队边缘 197.x) -> 目标（更稳，仅 Zero Trust 可用）` : ""}
 #
 # 节点名 "欧洲1@198.1-443" = 欧洲第 1 个落地，经 162.159.198.1:443 接入。
-# ZT- 开头的是 Zero Trust 团队边缘节点（162.159.197.x），免费号连不上。
+# ZT- 开头的是 Zero Trust 团队边缘节点（162.159.197.x）。
 #
-# 接入点 ${entries.length} 个 x 落地 ${opera.landings.length} 个 = 组合 ${combos} 个，
-# 外加 ${entries.length} 个直连接入点${zt ? ` 和 ${teamEntries.length} 个 ZT 团队边缘` : ""}${protonNames.length ? ` 和 ${protonNames.length} 个 Proton 落地` : ""}${windNames.length ? ` 和 ${windNames.length} 个 Windscribe 落地` : ""}。
-# 任一环失效都有替代路径。
+# 接入点共 ${frontAll.length} 个（免费边缘 ${freeEntries.length} + ZT 团队边缘 ${teamEntries.length}）
+# x 落地 ${opera.landings.length} 个 = 组合 ${combos} 个${protonNames.length ? `，外加 ${protonNames.length} 个 Proton 落地` : ""}${windNames.length ? ` 和 ${windNames.length} 个 Windscribe 落地` : ""}。
+# 任一环失效都有替代路径；某个族整体不可用时，另外两族照常工作。
 #
 # 需要 mihomo Alpha 分支：稳定版没有 masque outbound，也不认 dialer-proxy。
 # private-key 等同 WARP 账号凭据，别外传。
@@ -650,7 +759,9 @@ ${p(landingPool)}
       - DIRECT
 
   # 并发连接分散到多个接入点，单隧道跑不快时用它。
-  # 出口是同一个 WARP 账号，所以不存在会话对不上的问题。
+  # 混了两族（免费边缘 + ZT 团队边缘），出口 IP 因此会有两个；
+  # consistent-hashing 按目标域名散，同一个站点始终落在同一条隧道上，
+  # 不会出现「一个会话中途换出口」。要出口严格统一用下面两个单族池。
   - name: ⚡ 聚合
     type: load-balance
     strategy: consistent-hashing
@@ -659,7 +770,7 @@ ${p(landingPool)}
     tolerance: 40
     proxies:
 ${q(aggPool)}
-
+${ztAggDef}${freeAggDef}
   # 流媒体 / 测速专用出口。
   #
   # 为什么不跟网页共用 🚀 节点选择：4K 视频是持续几十 Mbps 的单条 UDP 流，
@@ -671,7 +782,7 @@ ${q(aggPool)}
     type: select
     proxies:
       - ⚡ 聚合
-      - DIRECT
+${streamExtra}      - DIRECT
 ${q(aggPool)}
 
   - name: 🎬 流媒体自动
@@ -717,17 +828,7 @@ ${q(aggPool)}
 ${p(picks)}
 
 ${locDefs}
-${ztGroupDef}
-  - name: WARP直连
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 40
-    timeout: 3000
-    max-failed-times: 2
-    lazy: false
-    proxies:
-${q(entries)}
+${ztGroupDef}${warpGroupDef}
 ${protonNames.length ? `
   - name: Proton线路
     type: select
@@ -775,7 +876,8 @@ ${rules}
   - MATCH,🐟 漏网之鱼
 `;
 
-  return { yaml, entries: entries.length, landings: opera.landings.length,
+  return { yaml, entries: frontAll.length, landings: opera.landings.length,
            combos, proton: protonNames.length, wind: windNames.length,
-           zeroTrust: zt, teamEdges: teamEntries.length };
+           zeroTrust: zt, teamEdges: teamEntries.length,
+           freeEdges: freeEntries.length };
 }

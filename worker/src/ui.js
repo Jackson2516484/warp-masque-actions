@@ -312,15 +312,16 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         <button class="gh" onclick="location.href=document.getElementById('u').value">下载</button>
       </div>
       <div class="note">
-        一份聚合，导进去有几类线路可切：<br>
-        <b>亚洲/欧洲/美洲线路</b> — 走 MASQUE 再落 Opera，能换出口国家，但多一跳会慢些。<br>
-        <b>WARP直连</b> — 只走 MASQUE，出口是 Cloudflare 自己的 IP，快但选不了国家。<br>
-        ${s.zeroTrust ? '<b>ZT团队边缘</b> — 走 197.x 团队边缘，更稳（Zero Trust 启用后出现）。<br>' : ""}
+        一份聚合，导进去有三族节点可切，<b>各用各的密钥、互不顶替</b>：<br>
+        <b>WARP直连</b> — 走免费边缘（198/199），出口是 Cloudflare 的 IP，快但选不了国家。<br>
+        ${s.zeroTrust ? '<b>ZT团队边缘</b> — 走 197.x 团队边缘（Zero Trust 独立密钥），更稳。<br>' : ""}
+        <b>亚洲/欧洲/美洲线路</b> — MASQUE 打底再落 Opera，能换出口国家，多一跳会慢些。<br>
         <b>Proton线路</b> — MASQUE 打底 + Proton WireGuard 落地，10 个国家（配置后出现）。<br>
         <b>Windscribe线路</b> — MASQUE 打底 + Windscribe 落地，13 个地区，有香港（配置后出现）。<br>
         <b>🌐 落地出口</b> — 出口 IP 敏感站点（Play / 维基 / 成人站 / AI）的专用出口，
         默认按「能换出口的落地 → 团队边缘 → 免费边缘」排优先级。<br>
-        <b>⚡ 聚合</b> — 并发连接分散到多条隧道，单隧道跑不快时用。<br>
+        <b>⚡ 聚合</b> — 并发连接分散到多条隧道，单隧道跑不快时用。混了两族，
+        出口 IP 会有两个；要严格统一就切 <b>⚡ 聚合ZT</b> 或 <b>⚡ 聚合WARP</b>。<br>
         <b>🎬 流媒体</b> — 视频/测速专用出口，和刷网页的流分开拨不同接入点。
         <b>看 4K 卡就先切这个组换个接入点试</b>；里面第一个成员「⚡ 聚合」是并发最好的选择。<br>
         <b>🚫 QUIC</b> — QUIC 总开关，默认 REJECT（浏览器自动回退 TCP），个别 App 要用就切 DIRECT。<br>
@@ -334,15 +335,18 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
       <div class="grid">
         <div class="cell"><div class="n">${stat.combos ?? "—"}</div><div class="l">组合节点</div></div>
         <div class="cell"><div class="n">${stat.entries ?? "—"}</div><div class="l">MASQUE 接入点</div></div>
+        <div class="cell"><div class="n">${stat.freeEdges || "—"}</div><div class="l">WARP 免费边缘</div></div>
+        <div class="cell"><div class="n">${s.zeroTrust ? (stat.teamEdges || "—") : "—"}</div><div class="l">ZT 团队边缘</div></div>
         <div class="cell"><div class="n">${stat.landings ?? "—"}</div><div class="l">Opera 落地</div></div>
-        <div class="cell"><div class="n">${s.zeroTrust ? (stat.teamEdges || "—") : (stat.entries ?? "—")}</div><div class="l">${s.zeroTrust ? "ZT 团队边缘" : "WARP 直连"}</div></div>
         <div class="cell"><div class="n">${stat.proton || "—"}</div><div class="l">Proton 落地</div></div>
         <div class="cell"><div class="n">${stat.wind || "—"}</div><div class="l">Windscribe 落地</div></div>
       </div>
       <div class="note">
         每个落地和每个接入点都组合一遍，任一环失效都还有别的路走。<br>
         节点名 <b>欧洲1@198.1-443</b> = 欧洲第 1 个落地，经 162.159.198.1:443 接入。<br>
-        <b>ZT-</b> 开头的是 Zero Trust 团队边缘（162.159.197.x），免费号连不上。
+        <b>ZT-</b> 开头的是 Zero Trust 团队边缘（162.159.197.x），用团队密钥；
+        其余接入点用免费 WARP 密钥。<b>两族并存</b>，一族整体连不上时另一族照常工作 ——
+        用 ⚡ 聚合WARP / ⚡ 聚合ZT 切开测一下延迟，就知道是哪一族的问题。
       </div>
     </div>
 
@@ -353,30 +357,38 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
       ${row("凭据剩余", leftTxt, left === null ? "" : left <= 0 ? "warn" : "ok")}
       ${row("到期时间", fmt(exp))}
       ${row("密码更新于", cred && cred.updatedAt ? fmt(new Date(cred.updatedAt)) : "—")}
-      ${row("WARP 设备", warp.deviceId ? warp.deviceId.slice(0, 8) + "…" : "—")}
-      ${row("设备模式", warp.zeroTrust ? "Zero Trust（团队边缘）" : "免费 WARP",
-             warp.zeroTrust ? "ok" : "")}
-      ${row("WARP 注册于", warp.registeredAt ? fmt(new Date(warp.registeredAt)) : "—")}
-      ${row("内网地址", warp.ipv4 || "—")}
+      ${row("免费 WARP 设备",
+             warp.deviceId ? warp.deviceId.slice(0, 8) + "…" : "未注册（免费边缘族不可用）",
+             warp.deviceId ? "ok" : "warn")}
+      ${row("免费 WARP 注册于",
+             warp.registeredAt ? fmt(new Date(warp.registeredAt)) : "—")}
+      ${row("免费 WARP 内网", warp.ipv4 || "—")}
+      ${ztDevice
+        ? row("ZT 团队设备", ztDevice.deviceId ? ztDevice.deviceId.slice(0, 8) + "…" : "—", "ok")
+          + row("ZT 注册于", ztDevice.registeredAt ? fmt(new Date(ztDevice.registeredAt)) : "—")
+          + row("ZT 内网", ztDevice.ipv4 || "—")
+        : row("ZT 团队设备", "未注册（只有免费边缘那一族）", "warn")}
+      ${s.warpErr ? row("免费 WARP 注册错误", s.warpErr, "err") : ""}
     </div>
 
     <div class="sec">
       <div class="sec-t">操作</div>
       <div class="sub">
         <button onclick="go('/api/refresh')">刷新 Opera 凭据</button>
-        <button class="gh" onclick="go('/api/reset-warp')">重注册 WARP 设备</button>
+        <button class="gh" onclick="go('/api/reset-warp')">重注册免费 WARP</button>
       </div>
       <div class="note">
         Opera 凭据 4 小时到期。<b>不用定时任务</b>——订阅被访问时才检查，
         没过期直接给缓存，过期了才重新注册。<br>
         想提前换一份就点刷新。<br>
-        WARP 设备信息存在 KV 里复用，<b>一般不用重注册</b>，除非 MASQUE 整体连不上。<br>
-        Zero Trust 启用时重注册会提示先清除 ZT 再重新粘 JWT（JWT 只有 60 秒寿命）。
+        两份 WARP 设备都存在 KV 里复用，<b>一般不用重注册</b>。免费边缘那一族整体
+        连不上时才点「重注册免费 WARP」——它只换免费那份，<b>Zero Trust 那份不动</b>。<br>
+        Zero Trust 要换设备得点「清除 ZT」再粘一份新 JWT（JWT 只有 60 秒寿命，不能静默重注册）。
       </div>
     </div>
 
     <div class="sec">
-      <div class="sec-t">Zero Trust 骨干</div>
+      <div class="sec-t">Zero Trust 团队边缘（和免费 WARP 并存）</div>
       ${ztDevice ? `
       <div class="row"><span class="k">状态</span><span class="v ok">已启用 ${
         ztDevice.accountType || "team"}</span></div>
@@ -384,15 +396,21 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         ztDevice.deviceId ? ztDevice.deviceId.slice(0, 8) + "…" : "—"}</span></div>
       <div class="row"><span class="k">注册于</span><span class="v">${
         ztDevice.registeredAt ? fmt(new Date(ztDevice.registeredAt)) : "—"}</span></div>
-      <div class="row"><span class="k">骨干节点</span><span class="v">${
-        stat.teamEdges || 0} 个团队边缘（162.159.197.x）</span></div>
+      <div class="row"><span class="k">团队边缘节点</span><span class="v ok">${
+        stat.teamEdges || 0} 个（162.159.197.x）</span></div>
+      <div class="row"><span class="k">免费边缘节点</span><span class="v ok">${
+        stat.freeEdges || 0} 个（198/199，独立密钥）</span></div>
       ` : `
-      <div class="row"><span class="k">状态</span><span class="v warn">未启用（用免费 WARP）</span></div>
+      <div class="row"><span class="k">状态</span><span class="v warn">未启用（只有免费边缘那一族）</span></div>
       `}
       <div class="note" style="margin-bottom:10px">
-        Zero Trust 把 WARP 注册成团队设备，用上 MASQUE 协议和<b>团队边缘
-        162.159.197.x</b>——实测比 198/199 那批免费边缘更稳，连断都少。
-        免费套餐 50 个席位，不限速。<br>
+        Zero Trust 注册的是<b>另一台设备</b>，走<b>团队边缘 162.159.197.x</b>，
+        实测比 198/199 那批免费边缘更稳，连断都少。免费套餐 50 个席位，不限速。<br>
+        <b>关键：两份设备并存，不是二选一。</b>CF 那边两套密钥分开认证 ——
+        团队密钥喂不进免费边缘，免费密钥也认证不过团队边缘。所以
+        Zero Trust 启用后，免费边缘那 57 个节点<b>照样在、照样能用</b>，
+        Proton / Windscribe / Opera 那些落地的首跳会横跨两族，
+        哪一族整体挂掉都还有一半落地能用。<br>
         <b>关于选国家要说清楚</b>：Zero Trust 免费版<b>不能</b>直接选出口国家，
         出口仍由 Cloudflare 任播就近落（多半是旧金山）。要选国家走的是下面
         Proton / Windscribe / Opera 那几条落地，Zero Trust 是把它们的骨干
@@ -403,7 +421,7 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
                spellcheck="false" autocomplete="off">
         <div class="sub" style="margin-top:0">
           <button onclick="enrollZt()">立即注册</button>
-          ${ztDevice ? '<button class="gh" onclick="go(\'/api/zt/clear\')">清除 ZT 回退免费</button>' : ""}
+          ${ztDevice ? '<button class="gh" onclick="go(\'/api/zt/clear\')">清除 ZT（只摘团队边缘那族）</button>' : ""}
         </div>
       </div>
       <div class="note">

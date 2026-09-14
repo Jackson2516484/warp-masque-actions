@@ -6,8 +6,9 @@
 //   1. 订阅被访问时按需重建：Opera 凭据没过期就直接给缓存，
 //      过期了才重新注册。凭据有效期 4 小时（opera-proxy 的 -refresh 默认值）
 //   2. WARP 注册信息存 KV 复用，不每次重注册（设备是有限资源）。
-//      Zero Trust 设备（粘 JWT 注册或流水线推来）也存 KV，启用后做骨干，
-//      走团队边缘 162.159.197.x；没有就回退 consumer WARP
+//      consumer 免费设备和 Zero Trust 团队设备**各存一份、并存**：
+//      前者出免费边缘 198/199 那族，后者出团队边缘 197.x 那族。
+//      两套密钥在 CF 那边分开认证，谁也顶替不了谁，所以两份都要留着。
 //   3. 首次访问引导设密码，之后订阅路径、改密码都在界面里做
 import { registerWarp } from "./warp.js";
 import { fetchOpera } from "./opera.js";
@@ -91,18 +92,36 @@ async function getWind(env) {
 
 /** 重建配置。WARP 复用，Opera 每次重取（凭据会过期）。
  *
- * Zero Trust 设备存在时用它做骨干（团队边缘更稳、免 MASQUE、不限速），
- * 没有就回退到 consumer WARP。两者结构一样，config.js 看 zeroTrust
- * 标志决定要不要放团队边缘节点。
+ * 两份 WARP 注册**并存**，不是二选一：
+ *   K_WARP  consumer 免费设备 -> 免费边缘 198/199
+ *   K_ZT    Zero Trust 团队设备 -> 团队边缘 197.x
+ *
+ * 两套密钥在 CF 那边是分开认证的，谁也不能顶替谁。所以两份都要读进来
+ * 交给 config.js，三族节点（WARP免费边缘 / ZT团队边缘 / 落地族）才能
+ * 在同一份订阅里都活着。
+ *
+ * 以前这里是 `const warp = zt || await getWarp()` —— ZT 设备一上位就把
+ * consumer 那份整个丢掉，而 config.js 又用 ZT 的密钥去生成免费边缘节点，
+ * 那 57 个节点全部认证失败，客户端里就只剩 ZT 那 4 个能用。
  */
 async function rebuild(env, { forceWarp = false } = {}) {
-  // 先看 ZT 设备要不要重建。forceWarp 是给 consumer 那套用的，
-  // ZT 设备有自己的 /api/zt/clear，这里不动它。
-  let zt = await env.KV.get(K_ZT, "json");
-  // ZT 设备在但凭据残缺（比如没拿到 ipv4）就当没有，避免配出来残废节点
-  if (zt && (!zt.privateKey || !zt.ipv4)) zt = null;
+  // ZT 设备凭据残缺（比如没拿到 ipv4）就当没有，避免配出残废节点
+  let ztDev = await env.KV.get(K_ZT, "json");
+  if (ztDev && (!ztDev.privateKey || !ztDev.ipv4)) ztDev = null;
 
-  const warp = zt || await getWarp(env, forceWarp && !zt);
+  // consumer 那份注册失败（设备数上限之类）不该把整份订阅干掉，
+  // ZT 那一路照样能用。两个都没有才真的没法生成。
+  let warp = null, warpErr = null;
+  try {
+    warp = await getWarp(env, forceWarp);
+  } catch (e) {
+    warpErr = e.message;
+  }
+  if (!warp && !ztDev) {
+    throw new Error(`没有可用的 WARP 设备：consumer 注册失败（${warpErr || "未知原因"}）` +
+                    "，Zero Trust 也没配");
+  }
+
   const opera = await fetchOpera();
   // Proton 凭据是流水线推来的，没有就跳过，不影响其他线路
   let proton = null;
@@ -118,27 +137,31 @@ async function rebuild(env, { forceWarp = false } = {}) {
     windErr = e.message;
   }
   const { yaml, entries, landings, combos, proton: pn, wind: wn,
-          zeroTrust: ztFlag, teamEdges } =
-    buildConfig(warp, opera, proton, wind);
+          zeroTrust: ztFlag, teamEdges, freeEdges } =
+    buildConfig(warp, opera, proton, wind, ztDev);
 
   const now = Date.now();
+  const devInfo = (d) => d ? {
+    deviceId: d.deviceId,
+    ipv4: d.ipv4,
+    ipv6: d.ipv6,
+    registeredAt: d.registeredAt,
+    zeroTrust: !!d.zeroTrust,
+    accountType: d.accountType || "",
+  } : null;
+
   const state = {
     updatedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + TTL_MS).toISOString(),
     stats: { entries, landings, combos, proton: pn || 0, wind: wn || 0,
-             teamEdges: teamEdges || 0 },
+             teamEdges: teamEdges || 0, freeEdges: freeEdges || 0 },
     protonExpiresAt: proton ? proton.expiresAt : null,
     wind: wind ? { userId: wind.account.userId, servers: wn || 0 } : null,
     windErr,
     zeroTrust: ztFlag,
-    warp: {
-      deviceId: warp.deviceId,
-      ipv4: warp.ipv4,
-      ipv6: warp.ipv6,
-      registeredAt: warp.registeredAt,
-      zeroTrust: !!warp.zeroTrust,
-      accountType: warp.accountType || "",
-    },
+    warpErr,
+    warp: devInfo(warp),
+    zt: devInfo(ztDev),
   };
 
   await env.KV.put(K_CFG, yaml);
@@ -460,19 +483,18 @@ export default {
       }
     }
 
-    // 重注册 WARP 设备，MASQUE 整体不通时才用。
-    // Zero Trust 启用时这条没意义：ZT 重注册要新的 60 秒 JWT，
-    // 不能静默做。引导用户走「清除 ZT → 重新粘 JWT」。
+    // 重注册 consumer 免费 WARP 设备，免费边缘那族整体连不上时才用。
+    //
+    // 两份设备现在是并存的，所以 Zero Trust 在也照样能重注册这一份 ——
+    // 它只换 K_WARP，不碰 K_ZT。ZT 那边要换仍得走「清除 ZT → 重新粘 JWT」
+    // （JWT 只有 60 秒寿命，没法静默重注册）。
     if (path === "/api/reset-warp" && req.method === "POST") {
-      const zt = await env.KV.get(K_ZT, "json");
-      if (zt) {
-        return json({ ok: false,
-          error: "当前用的是 Zero Trust 设备，不能静默重注册。" +
-                 "先点「清除 Zero Trust」，再粘一份新 JWT 重新注册。" });
-      }
+      const ztDev = await env.KV.get(K_ZT, "json");
       try {
         const s = await rebuild(env, { forceWarp: true });
-        return json({ ok: true, msg: `WARP 已重注册，${s.stats.combos} 个组合` });
+        return json({ ok: true,
+          msg: `免费 WARP 已重注册，免费边缘 ${s.stats.freeEdges || 0} 个` +
+               (ztDev ? "；Zero Trust 那份没动" : "") });
       } catch (e) {
         return json({ ok: false, error: e.message }, 500);
       }
@@ -502,17 +524,20 @@ export default {
           return json({ ok: true, msg: "设备已注册，但重建配置失败：" + e.message });
         }
         return json({ ok: true,
-          msg: `已注册 Zero Trust 设备，团队边缘 ${st.stats.teamEdges} 个已加入订阅` });
+          msg: `已注册 Zero Trust 设备：团队边缘 ${st.stats.teamEdges} 个 + ` +
+               `免费边缘 ${st.stats.freeEdges || 0} 个，两族并存` });
       } catch (e) {
         return json({ ok: false, error: e.message }, 500);
       }
     }
 
-    // 清掉 Zero Trust 设备，回退到 consumer WARP。
+    // 清掉 Zero Trust 设备。只摘掉团队边缘那一族，
+    // consumer 免费 WARP 那份不受影响，订阅里其他节点照常。
     if (path === "/api/zt/clear" && req.method === "POST") {
       await env.KV.delete(K_ZT);
       try { await rebuild(env); } catch { /* 重建失败不影响清除本身 */ }
-      return json({ ok: true, msg: "已清除 Zero Trust，回退到免费 WARP" });
+      return json({ ok: true,
+        msg: "已清除 Zero Trust（团队边缘那一族），免费 WARP 和落地族不受影响" });
     }
 
     // 清掉 Windscribe 账号。换号要重跑流水线 —— Worker 自己开不出可用的号
