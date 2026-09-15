@@ -334,12 +334,18 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   const gs = [...y.matchAll(/^  - name: (.+)$/gm)].map((m) => m[1]);
   const entryNames = [...y.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
 
-  // 关 QUIC。必须排在全部规则最前面：浏览器用的 QUIC 在 MASQUE 隧道里
-  // 等于套两层 QUIC，Google 系会一直转圈；拦掉之后自动回退 TCP。
+  // QUIC 两连招，必须排在全部规则最前面，且顺序不能颠倒：
+  //   1) 国内 UDP 443 放行直连 —— B站/微信/抖音/淘宝/支付宝 全靠 QUIC，
+  //      一刀切 REJECT 等于让它们每次先失败一次再回退 TCP，手机上就是
+  //      「一打开就转圈」。这条只匹配 UDP，不会把该代理的流量放走。
+  //   2) 其余（境外）QUIC 交给 🚫 QUIC 组。MASQUE 隧道里再跑 QUIC 等于
+  //      双层 QUIC，Google 系会一直转圈；拦掉后立刻拿到拒绝、迅速回退 TCP。
   const rulesBlock = y.slice(y.indexOf("\nrules:\n") + "\nrules:\n".length);
-  const firstRule = rulesBlock.split("\n")[0];
-  t("第一条规则是关 QUIC",
-    firstRule.includes("AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC"));
+  const ruleL = rulesBlock.split("\n");
+  t("第一条是国内 QUIC 放行直连",
+    ruleL[0].includes("AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT"));
+  t("第二条是关境外 QUIC",
+    ruleL[1].includes("AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC"));
   t("有 🚫 QUIC 组", gs.includes("🚫 QUIC"));
 
   // 测速脚本靠这条量真实吞吐，落到直连就量成自家宽带了
@@ -388,6 +394,25 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("自动选择不再含组名",
     !auto.includes("      - 亚洲线路") && !autoMembers.includes("亚洲线路"));
   t("自动选择关掉 lazy", /lazy: false/.test(auto));
+  // 但成员必须是**精选池**，不能是全量：手机上并发三十多次 MASQUE 握手
+  // 会被系统/电量策略限制，测不完的直接标红 —— 用户看到的就是
+  // 「可用节点太少」，开机后还卡一阵。精选池只留代表性端口。
+  t(`自动选择用精选池 ${autoMembers.length} 个 < 全量 ${aggMembers.length} 个`,
+    autoMembers.length > 0 && autoMembers.length < aggMembers.length);
+  t("精选池只含 443/4443/8443/8095",
+    autoMembers.every((m) => {
+      const mm = /-(\d+)$/.exec(m);
+      return !mm || [443, 4443, 8443, 8095].includes(Number(mm[1]));
+    }));
+
+  // 唯一保留全量接入点（含 IPv6）的组，必须关掉 eager 测速：
+  // 57 个 MASQUE 节点全测在手机上是灾难，切到这组时再测即可。
+  const warpG = y.split("  - name: WARP直连")[1].split("\n  - name:")[0];
+  t("WARP直连（全量）改成按需测速",
+    /type: url-test/.test(warpG) && /lazy: true/.test(warpG));
+  const warpGMembers = [...warpG.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t(`WARP直连仍是全量 ${warpGMembers.length} 个`,
+    warpGMembers.length > aggMembers.length);
 
   // DNS 不能回答 AAAA：本地 IPv6 出口烂的时候，返回 AAAA 会让客户端
   // 优先往 v6 上撞，表现就是「延迟不高但打不开」
@@ -406,13 +431,28 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   const streamMembers = [...stream.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
   t(`流媒体 ${streamMembers.length} 个成员都是真实接入点`,
     streamMembers.length > 0 && streamMembers.every((m) => entryNames.includes(m)));
-  t("流媒体第一个成员是 ⚡ 聚合", stream.indexOf("- ⚡ 聚合") > 0 &&
-    stream.indexOf("- ⚡ 聚合") < (stream.indexOf('"') > 0 ? stream.indexOf('"') : Infinity));
+  // 默认出口必须是 url-test 组，不能是 load-balance：部分手机端内核对
+  // 「select 组里嵌 load-balance」支持不全，那个成员一失效整组就哑了，
+  // 表现正是「手机端 YouTube 一直转圈、电脑上却正常」。
+  t("流媒体默认出口是 url-test 组，不嵌 load-balance",
+    stream.includes("      - 🎬 流媒体自动") &&
+    stream.indexOf("- 🎬 流媒体自动") < stream.indexOf("- ⚡ 聚合"));
+  // CF 的出口 IP 被 Google 判成机房限流时，得能在流媒体组里直接换出口
+  t("流媒体含能换出口的落地组",
+    stream.includes("      - 🌐 落地出口") &&
+    stream.includes("      - 📹 油管视频") &&
+    /^      - DIRECT$/m.test(stream));
+  t("流媒体组的组名引用都真实存在",
+    [...stream.matchAll(/^      - ([^\s"].+)$/gm)].map((m) => m[1].trim())
+      .filter((m) => m !== "DIRECT")
+      .every((m) => gs.includes(m)));
   const streamAuto = y.split("  - name: 🎬 流媒体自动")[1].split("\n  - name:")[0];
   const streamAutoMembers = [...streamAuto.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
   t("流媒体自动成员都是真实接入点",
     streamAutoMembers.length > 0 && streamAutoMembers.every((m) => entryNames.includes(m)));
   t("流媒体自动关掉 lazy", /type: url-test/.test(streamAuto) && /lazy: false/.test(streamAuto));
+  t(`流媒体自动也用精选池 ${streamAutoMembers.length} 个 < 全量 ${aggMembers.length} 个`,
+    streamAutoMembers.length > 0 && streamAutoMembers.length < aggMembers.length);
 
   // 规则集只盖到 googlevideo/nflx 主域，这些拉流 CDN 全在外面 ——
   // 漏掉就回落漏网之鱼，跟着默认节点走了

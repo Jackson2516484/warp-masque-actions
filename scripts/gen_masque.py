@@ -10,6 +10,7 @@
 """
 import json
 import os
+import re
 import sys
 import urllib.parse
 
@@ -21,6 +22,11 @@ V6 = ["2606:4700:103::1", "2606:4700:103::2",
       "2606:4700:104::1", "2606:4700:104::2"]
 # 4443/8095 是后来补测出来的，实测 8/8 全通
 PORTS = (443, 500, 1701, 4500, 4443, 8443, 8095)
+# 精选端口。给「♻️ 自动选择 / 🎬 流媒体自动」这类要全员测速的组用。
+# 手机上并发 30+ 次 MASQUE 握手会被系统限制，测不完的直接显示超时，
+# 用户看到的就是「节点少 / 慢」。443 通用，4443/8095 最容易被 QoS 漏过，
+# 8443 通用备选；全量 7 个端口仍在 ☑️ 手动切换 里能手选。
+PICK_PORTS = (443, 4443, 8443, 8095)
 
 # CF 没有 A 记录指向 MASQUE 段，官方域名只能用在 SNI 上
 OFFICIAL_SNI = "zt-masque.cloudflareclient.com"
@@ -227,15 +233,21 @@ def build(cfg):
     path: ./ruleset/{pn}.list""")
         rules.append(f"  - RULE-SET,{pn},{group}")
 
-    # 排最前面的三条，顺序不能动：
-    # 1) 关 QUIC。浏览器默认用 QUIC(UDP 443)，在 MASQUE 隧道里等于套了两层
-    #    QUIC，握手和丢包恢复都被放大，表现就是「Google 系一直转圈」。
-    #    拦掉之后浏览器会自动回退 TCP。要给某个 App 放行就在客户端把
-    #    🚫 QUIC 组切成 DIRECT。
+    # 排最前面的几条，顺序不能动：
+    # 1) QUIC 两连招，顺序不能颠倒。
+    #    a. 国内流量的 QUIC 放行直连：B站 / 微信 / 抖音 / 淘宝 / 支付宝
+    #       这些国内 App 全靠 QUIC 提速，一刀切 REJECT 等于让它们每次先
+    #       失败一次再回退 TCP —— 手机上就是「一打开就转圈」。只匹配 UDP，
+    #       不会把该代理的流量放走。geosite 数据没下载成功时这条不匹配，
+    #       安全降级到下一条。
+    #    b. 其余（境外）QUIC 交给 🚫 QUIC 组（默认 REJECT）。MASQUE 隧道里
+    #       再跑 QUIC 等于双层 QUIC，握手和丢包恢复都被放大；拦掉后 App
+    #       立刻拿到拒绝、迅速回退 TCP。要放行就在客户端把该组切成 DIRECT。
     # 2) speed.cloudflare.com 钉走代理 —— 本地测速脚本靠它量真实吞吐，
     #    落到直连就量成自家宽带的速度了。
     # 3) Play / 维基 / 成人站保证走代理（纯 WARP 换不了出口，只能保证走代理）。
     head = [
+        "  - AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT",
         "  - AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC",
         "  - DOMAIN-SUFFIX,speed.cloudflare.com,🚀 节点选择",
     ]
@@ -260,6 +272,15 @@ def build(cfg):
     agg_pool = [n for n in names if not n.startswith("WARP6-")]
     # 流媒体组的成员池。只有 IPv6 接入点可用时（纯 v6 网络）才轮到 v6。
     stream_pool = agg_pool or list(names)
+    # 精选测速池。手机上并发做三十多次 MASQUE 握手会被系统/电量策略限制，
+    # 测不完的直接标红 —— 用户看到的就是「可用节点太少」，开机后还卡一阵。
+    # 只留 PICK_PORTS 里的代表性端口（443 通用、4443/8095 最容易被 QoS 漏过、
+    # 8443 通用备选），全量 7 个端口仍在 ☑️ 手动切换 组里能手选。
+    def _picked(n):
+        m = re.search(r"-(\d+)$", n)
+        return (not m) or int(m.group(1)) in PICK_PORTS
+
+    pick_pool = [n for n in (agg_pool or list(names)) if _picked(n)]
 
     links = masque_links(cfg, priv, pub)
 
@@ -373,8 +394,9 @@ proxies:
 {chr(10).join(proxies)}
 
 proxy-groups:
-  # QUIC 总开关。默认 REJECT（浏览器会自动回退 TCP）；
-  # 个别 App 非用 QUIC 不可的话，在客户端里把它切成 DIRECT。
+  # 境外 QUIC 总开关，默认 REJECT（App 收到拒绝会立刻回退 TCP）。
+  # 国内域名的 QUIC 已在规则里自动放行直连，不受这个组影响；
+  # 某个境外 App 死磕 QUIC 导致一直转圈，就把它切成 DIRECT。
   - name: 🚫 QUIC
     type: select
     proxies:
@@ -397,14 +419,20 @@ proxy-groups:
   # 也是运营商 QoS 最先盯上的目标；而网页是几百个短连接，被压一点感觉不到。
   # 拆开之后，看视频的流和刷网页的流落在不同接入点上，互不抢。
   #
+  # 默认出口是 🎬 流媒体自动（url-test），不挂 ⚡ 聚合（load-balance）：
+  # select 组里嵌 load-balance 在部分手机端内核上支持不全，那个成员一失效
+  # 整组就哑了 —— 表现正是「手机端 YouTube 一直转圈、电脑上却正常」。
+  #
   # 选定后写进 profile.store-selected，重启不丢。
   - name: 🎬 流媒体
     type: select
     proxies:
+      - 🎬 流媒体自动
       - ⚡ 聚合
       - DIRECT
-{ind(agg_pool)}
+{ind(pick_pool)}
 
+  # 只测精选池（手机上也测得完），开机就绪。
   - name: 🎬 流媒体自动
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -414,7 +442,7 @@ proxy-groups:
     max-failed-times: 2
     lazy: false
     proxies:
-{ind(agg_pool)}
+{ind(pick_pool)}
 
   - name: 🚀 节点选择
     type: select
@@ -433,6 +461,9 @@ proxy-groups:
   # 关闭 lazy、间隔压到 180s：用户抱怨「自动选择挑不到最快」基本都是
   # 三件事叠出来的 —— lazy 让首次使用才测、tolerance 太大不切、间隔太长
   # 结果过期。这里三个都收紧。
+  #
+  # 成员用精选池而不是全量：手机上并发 57 次 MASQUE 握手会被系统限流，
+  # 测不完的直接标红，看着就像「节点全死了」。要全量去 ☑️ 手动切换 组手选。
   - name: ♻️ 自动选择
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -442,7 +473,7 @@ proxy-groups:
     max-failed-times: 2
     lazy: false
     proxies:
-{ind(names)}
+{ind(pick_pool)}
 
   - name: 🔄 故障转移
     type: fallback

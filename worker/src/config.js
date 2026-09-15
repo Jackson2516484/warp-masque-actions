@@ -7,6 +7,15 @@ const V4 = ["162.159.198.1", "162.159.198.2", "162.159.199.1", "162.159.199.2"];
 const V6 = ["2606:4700:103::1", "2606:4700:103::2",
             "2606:4700:104::1", "2606:4700:104::2"];
 const PORTS = [443, 500, 1701, 4500, 4443, 8443, 8095];
+// 精选端口。给「♻️ 自动选择 / 🎬 流媒体自动」这类**要全员测速**的组用。
+//
+// 手机上并发做 30+ 次 MASQUE 握手会被系统/电量策略限制，测不完的直接
+// 显示超时 —— 用户看到的就是「可用节点太少」，而且开机后一阵子整机发卡。
+// 手机上这两组各测 17 个（4 端口 x 4 个 IPv4 + 官方域名）比原来各测 33 个
+// 轻一半，覆盖度却几乎不降：443 是通用口，4443/8095 是实测最容易被 QoS
+// 漏过的冷门口，8443 是通用备选。
+// 全量 7 个端口仍在 WARP直连 / 🎬 流媒体 组里，切过去能手选。
+const PICK_PORTS = [443, 4443, 8443, 8095];
 const TEAM_V4 = ["162.159.197.1", "162.159.197.2"];
 const TEAM_PORTS = [443, 8443];
 const ZT_SNI = "zt-masque.cloudflareclient.com";
@@ -261,12 +270,18 @@ function buildRules() {
     rules.push(`  - RULE-SET,${pn},${group}`);
   });
 
-  // 排在最前面的三条，顺序不能动：
+  // 排在最前面的几条，顺序不能动：
   //
-  // 1) 关 QUIC。浏览器默认用 QUIC(UDP 443)，在 MASQUE 隧道里等于套了两层 QUIC，
-  //    握手和丢包恢复都被放大，表现就是「Google 系一直转圈」。
-  //    拦掉之后浏览器探测到 QUIC 不通会自动回退 TCP，用户无感。
-  //    哪天某个 App 非要 QUIC，在客户端的 🚫 QUIC 组里切成 DIRECT 即可。
+  // 1) QUIC 两连招，顺序不能颠倒。
+  //    a. 国内流量的 QUIC 放行直连：B站 / 微信 / 抖音 / 淘宝 / 支付宝
+  //       这些国内 App 全靠 QUIC 提速，一刀切 REJECT 等于让它们每次先
+  //       失败一次再回退 TCP —— 手机上就是「一打开就转圈」。这条只匹配
+  //       UDP 443，不碰 TCP，不会把本该代理的流量放走。geosite 数据没
+  //       下载成功时这条永不匹配，安全降级到下一条。
+  //    b. 境外 QUIC 交给 🚫 QUIC 组（默认 REJECT）：MASQUE 隧道里再跑
+  //       QUIC 等于双层 QUIC，握手和丢包恢复都被放大；拦掉后 App 立刻
+  //       拿到拒绝、迅速回退 TCP，比让它去连被墙的黑洞（超时好几秒）快。
+  //       哪天某个 App 非要 QUIC，在客户端的 🚫 QUIC 组里切成 DIRECT 即可。
   // 2) speed.cloudflare.com 钉走代理 —— 本地测速脚本要用它量真实吞吐，
   //    不能让它落到直连（否则量到的是你自家宽带的速度）。
   // 3) 出口 IP 敏感的域名（Play / 维基 / 成人站）走 🌐 落地出口。
@@ -275,6 +290,7 @@ function buildRules() {
   //    Prime 的 aiv-cdn、Twitch 的 ttvnw、TikTok 的 ibytedtos 都不在里面 ——
   //    这些才是 4K 真正拉流的 CDN，漏掉就回落到漏网之鱼了。
   const head = [
+    `  - AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT`,
     `  - AND,((NETWORK,UDP),(DST-PORT,443)),🚫 QUIC`,
     `  - DOMAIN-SUFFIX,speed.cloudflare.com,🚀 节点选择`,
   ];
@@ -647,6 +663,16 @@ ${q(names)}`).join("\n\n");
   const ztAggPool = teamEntries;
   const freeAggPool = freeV4;
 
+  // 精选测速池：只留 PICK_PORTS 里的代表性端口，给需要全员测速的
+  // url-test 组用（♻️ 自动选择 / 🎬 流媒体自动）。手机上的测速量
+  // 从 33 个降到 17 个，避免「测不完 -> 一片超时 -> 看着像没节点」。
+  // 名字里没有端口段的（官方域名那个节点）无条件保留。
+  const pickNode = (n) => {
+    const m = /-(\d+)$/.exec(n);
+    return !m || PICK_PORTS.includes(Number(m[1]));
+  };
+  const pickPool = [...freeV4.filter(pickNode), ...teamEntries.filter(pickNode)];
+
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}线路
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -698,6 +724,11 @@ ${q(freeAggPool)}
 
   // 免费边缘直连组。没有 consumer 设备时整组不出现 —— 组可以少，
   // 但绝不能引用不存在的组（内核加载会直接失败）。
+  //
+  // 这里是唯一保留「全量 57 个接入点（含 IPv6）」的组，所以 lazy 必须
+  // 是 true：关掉 lazy 等于让手机一开机就并发做 57 次 MASQUE 握手，
+  // 移动网络下大多数会撞上 3 秒超时，客户端里一片红。
+  // 需要它时（切到这一组）内核才开测，测完即为准。
   const warpGroupDef = freeEntries.length ? `
   - name: WARP直连
     type: url-test
@@ -706,15 +737,31 @@ ${q(freeAggPool)}
     tolerance: 40
     timeout: 3000
     max-failed-times: 2
-    lazy: false
+    lazy: true
     proxies:
 ${q(freeEntries)}
 ` : "";
 
-  // 流媒体组的可选出口：聚合 + 两个单族聚合，按存在的出
-  const streamExtra =
-    (zt ? "      - ⚡ 聚合ZT\n" : "") +
-    (freeV4.length ? "      - ⚡ 聚合WARP\n" : "");
+  // 流媒体组的候选出口，紧跟默认出口之后列出。
+  //
+  // 第一个成员（= 默认出口）在下面的 YAML 里是 🎬 流媒体自动，不是
+  // ⚡ 聚合：url-test 是内核里兼容性最广的组类型，而「select 组里嵌
+  // load-balance」在部分手机端内核上支持不全 —— 那个成员一失效整组就
+  // 哑了，表现正是「手机端 YouTube 一直转圈、电脑上却正常」。
+  //
+  // 后面接能换出口的落地组：Cloudflare 的出口 IP 被 YouTube 判成数据中心
+  // 而限流时，切到 Proton / Windscribe 那几条就绕开了 —— 这是「YouTube
+  // 打不开」最快的一个自救动作。所有组都按存在与否条件拼接，不留悬空引用。
+  const streamExtra = [
+    "      - ⚡ 聚合",
+    zt ? "      - ⚡ 聚合ZT" : "",
+    freeV4.length ? "      - ⚡ 聚合WARP" : "",
+    protonNames.length ? "      - Proton线路" : "",
+    windNames.length ? "      - Windscribe线路" : "",
+    "      - 🌐 落地出口",
+    "      - 📹 油管视频",
+    "      - DIRECT",
+  ].filter(Boolean).join("\n") + "\n";
 
   const { prov, rules } = buildRules();
 
@@ -777,14 +824,16 @@ ${ztAggDef}${freeAggDef}
   # 也是运营商 QoS 最先盯上的目标；网页是几百个短连接，被压一点感觉不到。
   # 拆开之后看视频的流和刷网页的流落在不同接入点上，互不抢。
   #
+  # YouTube 打不开 / 一直转圈时，往下切成下面接的落地组：
+  # CF 自己的出口 IP 被 Google 判成机房而限流时，换个出口就好。
   # 选定后写进 profile.store-selected，重启不丢。
   - name: 🎬 流媒体
     type: select
     proxies:
-      - ⚡ 聚合
-${streamExtra}      - DIRECT
-${q(aggPool)}
+      - 🎬 流媒体自动
+${streamExtra}${q(pickPool)}
 
+  # 流媒体自动选优。只测精选池（手机上也测得完），开机就绪。
   - name: 🎬 流媒体自动
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -794,7 +843,7 @@ ${q(aggPool)}
     max-failed-times: 2
     lazy: false
     proxies:
-${q(aggPool)}
+${q(pickPool)}
 
   - name: 🚀 节点选择
     type: select
@@ -806,6 +855,10 @@ ${p(picks)}
   # 原来这里是 url-test 套 url-test（成员全是组）。嵌套组的延迟取的是
   # 子组「当前选中节点」的旧值，不刷新就一直是旧值 —— 这就是
   # 「自动选择挑不到最快」的根因。摊平成真实接入点，并关掉 lazy 让开机就测。
+  #
+  # 成员用精选池而不是全量：手机上并发 33 次 MASQUE 握手会被系统限流，
+  # 测不完的直接标红，看着就像「节点全死了」。精选池 17 个够覆盖
+  # 443/4443/8443/8095 四个代表性端口，要全量就在直连组里手选。
   - name: ♻️ 自动选择
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -815,7 +868,7 @@ ${p(picks)}
     max-failed-times: 2
     lazy: false
     proxies:
-${q(aggPool)}
+${q(pickPool)}
 
   - name: 🔄 故障转移
     type: fallback

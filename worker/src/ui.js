@@ -322,10 +322,18 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         默认按「能换出口的落地 → 团队边缘 → 免费边缘」排优先级。<br>
         <b>⚡ 聚合</b> — 并发连接分散到多条隧道，单隧道跑不快时用。混了两族，
         出口 IP 会有两个；要严格统一就切 <b>⚡ 聚合ZT</b> 或 <b>⚡ 聚合WARP</b>。<br>
-        <b>🎬 流媒体</b> — 视频/测速专用出口，和刷网页的流分开拨不同接入点。
-        <b>看 4K 卡就先切这个组换个接入点试</b>；里面第一个成员「⚡ 聚合」是并发最好的选择。<br>
-        <b>🚫 QUIC</b> — QUIC 总开关，默认 REJECT（浏览器自动回退 TCP），个别 App 要用就切 DIRECT。<br>
-        套娃线路超时或落地挂了，切${s.zeroTrust ? "ZT团队边缘或" : ""}WARP直连顶上。
+        <b>🎬 流媒体</b> — 视频/测速专用出口，和刷网页的流分开拨不同接入点。<br>
+        &nbsp;&nbsp;<b>YouTube 打不开 / 一直转圈就切这个组</b>：默认走「🎬 流媒体自动」，
+        还不行就往下切成 Proton线路 / Windscribe线路 换个出口 IP
+        （CF 的 IP 被 Google 判成机房时只有换出口能救）。<br>
+        <b>🚫 QUIC</b> — QUIC 总开关。国内域名的 QUIC 已自动放行直连，不用管；
+        只剩境外 QUIC 归这个组，默认 REJECT（App 会立刻回退 TCP）。<br>
+        &nbsp;&nbsp;某个境外 App 一直转圈、别的都正常，把它切成 DIRECT 试一次 ——
+        能好就是那个 App 不肯放弃 QUIC。<br>
+        套娃线路超时或落地挂了，切${s.zeroTrust ? "ZT团队边缘或" : ""}WARP直连顶上。<br>
+        <b>手机端提示</b>：手机上并发测速会被系统限制，所以「♻️ 自动选择」和
+        「🎬 流媒体自动」只测精选的 4 个端口（约 20 个接入点）；要全量 7 端口的
+        在「WARP直连」里手选（那一组是按需测速，切过去才开测）。
       </div>
       <div id="msg"></div>
     </div>

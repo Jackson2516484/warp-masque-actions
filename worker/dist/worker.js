@@ -387,6 +387,7 @@ var V6 = [
   "2606:4700:104::2"
 ];
 var PORTS = [443, 500, 1701, 4500, 4443, 8443, 8095];
+var PICK_PORTS = [443, 4443, 8443, 8095];
 var TEAM_V4 = ["162.159.197.1", "162.159.197.2"];
 var TEAM_PORTS = [443, 8443];
 var ZT_SNI = "zt-masque.cloudflareclient.com";
@@ -707,6 +708,7 @@ function buildRules() {
     rules.push(`  - RULE-SET,${pn},${group}`);
   });
   const head2 = [
+    `  - AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT`,
     `  - AND,((NETWORK,UDP),(DST-PORT,443)),\u{1F6AB} QUIC`,
     `  - DOMAIN-SUFFIX,speed.cloudflare.com,\u{1F680} \u8282\u70B9\u9009\u62E9`
   ];
@@ -1010,6 +1012,11 @@ ${q(names)}`).join("\n\n");
   const aggPool = frontV4;
   const ztAggPool = teamEntries;
   const freeAggPool = freeV4;
+  const pickNode = (n) => {
+    const m = /-(\d+)$/.exec(n);
+    return !m || PICK_PORTS.includes(Number(m[1]));
+  };
+  const pickPool = [...freeV4.filter(pickNode), ...teamEntries.filter(pickNode)];
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}\u7EBF\u8DEF
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -1058,11 +1065,20 @@ ${q(freeAggPool)}
     tolerance: 40
     timeout: 3000
     max-failed-times: 2
-    lazy: false
+    lazy: true
     proxies:
 ${q(freeEntries)}
 ` : "";
-  const streamExtra = (zt ? "      - \u26A1 \u805A\u5408ZT\n" : "") + (freeV4.length ? "      - \u26A1 \u805A\u5408WARP\n" : "");
+  const streamExtra = [
+    "      - \u26A1 \u805A\u5408",
+    zt ? "      - \u26A1 \u805A\u5408ZT" : "",
+    freeV4.length ? "      - \u26A1 \u805A\u5408WARP" : "",
+    protonNames.length ? "      - Proton\u7EBF\u8DEF" : "",
+    windNames.length ? "      - Windscribe\u7EBF\u8DEF" : "",
+    "      - \u{1F310} \u843D\u5730\u51FA\u53E3",
+    "      - \u{1F4F9} \u6CB9\u7BA1\u89C6\u9891",
+    "      - DIRECT"
+  ].filter(Boolean).join("\n") + "\n";
   const { prov, rules } = buildRules();
   const yaml = `# Opera VPN over Cloudflare WARP (MASQUE)
 # \u7531 Cloudflare Worker \u751F\u6210\u4E8E ${(/* @__PURE__ */ new Date()).toISOString()}
@@ -1123,14 +1139,16 @@ ${ztAggDef}${freeAggDef}
   # \u4E5F\u662F\u8FD0\u8425\u5546 QoS \u6700\u5148\u76EF\u4E0A\u7684\u76EE\u6807\uFF1B\u7F51\u9875\u662F\u51E0\u767E\u4E2A\u77ED\u8FDE\u63A5\uFF0C\u88AB\u538B\u4E00\u70B9\u611F\u89C9\u4E0D\u5230\u3002
   # \u62C6\u5F00\u4E4B\u540E\u770B\u89C6\u9891\u7684\u6D41\u548C\u5237\u7F51\u9875\u7684\u6D41\u843D\u5728\u4E0D\u540C\u63A5\u5165\u70B9\u4E0A\uFF0C\u4E92\u4E0D\u62A2\u3002
   #
+  # YouTube \u6253\u4E0D\u5F00 / \u4E00\u76F4\u8F6C\u5708\u65F6\uFF0C\u5F80\u4E0B\u5207\u6210\u4E0B\u9762\u63A5\u7684\u843D\u5730\u7EC4\uFF1A
+  # CF \u81EA\u5DF1\u7684\u51FA\u53E3 IP \u88AB Google \u5224\u6210\u673A\u623F\u800C\u9650\u6D41\u65F6\uFF0C\u6362\u4E2A\u51FA\u53E3\u5C31\u597D\u3002
   # \u9009\u5B9A\u540E\u5199\u8FDB profile.store-selected\uFF0C\u91CD\u542F\u4E0D\u4E22\u3002
   - name: \u{1F3AC} \u6D41\u5A92\u4F53
     type: select
     proxies:
-      - \u26A1 \u805A\u5408
-${streamExtra}      - DIRECT
-${q(aggPool)}
+      - \u{1F3AC} \u6D41\u5A92\u4F53\u81EA\u52A8
+${streamExtra}${q(pickPool)}
 
+  # \u6D41\u5A92\u4F53\u81EA\u52A8\u9009\u4F18\u3002\u53EA\u6D4B\u7CBE\u9009\u6C60\uFF08\u624B\u673A\u4E0A\u4E5F\u6D4B\u5F97\u5B8C\uFF09\uFF0C\u5F00\u673A\u5C31\u7EEA\u3002
   - name: \u{1F3AC} \u6D41\u5A92\u4F53\u81EA\u52A8
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -1140,7 +1158,7 @@ ${q(aggPool)}
     max-failed-times: 2
     lazy: false
     proxies:
-${q(aggPool)}
+${q(pickPool)}
 
   - name: \u{1F680} \u8282\u70B9\u9009\u62E9
     type: select
@@ -1152,6 +1170,10 @@ ${p(picks)}
   # \u539F\u6765\u8FD9\u91CC\u662F url-test \u5957 url-test\uFF08\u6210\u5458\u5168\u662F\u7EC4\uFF09\u3002\u5D4C\u5957\u7EC4\u7684\u5EF6\u8FDF\u53D6\u7684\u662F
   # \u5B50\u7EC4\u300C\u5F53\u524D\u9009\u4E2D\u8282\u70B9\u300D\u7684\u65E7\u503C\uFF0C\u4E0D\u5237\u65B0\u5C31\u4E00\u76F4\u662F\u65E7\u503C \u2014\u2014 \u8FD9\u5C31\u662F
   # \u300C\u81EA\u52A8\u9009\u62E9\u6311\u4E0D\u5230\u6700\u5FEB\u300D\u7684\u6839\u56E0\u3002\u644A\u5E73\u6210\u771F\u5B9E\u63A5\u5165\u70B9\uFF0C\u5E76\u5173\u6389 lazy \u8BA9\u5F00\u673A\u5C31\u6D4B\u3002
+  #
+  # \u6210\u5458\u7528\u7CBE\u9009\u6C60\u800C\u4E0D\u662F\u5168\u91CF\uFF1A\u624B\u673A\u4E0A\u5E76\u53D1 33 \u6B21 MASQUE \u63E1\u624B\u4F1A\u88AB\u7CFB\u7EDF\u9650\u6D41\uFF0C
+  # \u6D4B\u4E0D\u5B8C\u7684\u76F4\u63A5\u6807\u7EA2\uFF0C\u770B\u7740\u5C31\u50CF\u300C\u8282\u70B9\u5168\u6B7B\u4E86\u300D\u3002\u7CBE\u9009\u6C60 17 \u4E2A\u591F\u8986\u76D6
+  # 443/4443/8443/8095 \u56DB\u4E2A\u4EE3\u8868\u6027\u7AEF\u53E3\uFF0C\u8981\u5168\u91CF\u5C31\u5728\u76F4\u8FDE\u7EC4\u91CC\u624B\u9009\u3002
   - name: \u267B\uFE0F \u81EA\u52A8\u9009\u62E9
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -1161,7 +1183,7 @@ ${p(picks)}
     max-failed-times: 2
     lazy: false
     proxies:
-${q(aggPool)}
+${q(pickPool)}
 
   - name: \u{1F504} \u6545\u969C\u8F6C\u79FB
     type: fallback
@@ -1664,10 +1686,18 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         \u9ED8\u8BA4\u6309\u300C\u80FD\u6362\u51FA\u53E3\u7684\u843D\u5730 \u2192 \u56E2\u961F\u8FB9\u7F18 \u2192 \u514D\u8D39\u8FB9\u7F18\u300D\u6392\u4F18\u5148\u7EA7\u3002<br>
         <b>\u26A1 \u805A\u5408</b> \u2014 \u5E76\u53D1\u8FDE\u63A5\u5206\u6563\u5230\u591A\u6761\u96A7\u9053\uFF0C\u5355\u96A7\u9053\u8DD1\u4E0D\u5FEB\u65F6\u7528\u3002\u6DF7\u4E86\u4E24\u65CF\uFF0C
         \u51FA\u53E3 IP \u4F1A\u6709\u4E24\u4E2A\uFF1B\u8981\u4E25\u683C\u7EDF\u4E00\u5C31\u5207 <b>\u26A1 \u805A\u5408ZT</b> \u6216 <b>\u26A1 \u805A\u5408WARP</b>\u3002<br>
-        <b>\u{1F3AC} \u6D41\u5A92\u4F53</b> \u2014 \u89C6\u9891/\u6D4B\u901F\u4E13\u7528\u51FA\u53E3\uFF0C\u548C\u5237\u7F51\u9875\u7684\u6D41\u5206\u5F00\u62E8\u4E0D\u540C\u63A5\u5165\u70B9\u3002
-        <b>\u770B 4K \u5361\u5C31\u5148\u5207\u8FD9\u4E2A\u7EC4\u6362\u4E2A\u63A5\u5165\u70B9\u8BD5</b>\uFF1B\u91CC\u9762\u7B2C\u4E00\u4E2A\u6210\u5458\u300C\u26A1 \u805A\u5408\u300D\u662F\u5E76\u53D1\u6700\u597D\u7684\u9009\u62E9\u3002<br>
-        <b>\u{1F6AB} QUIC</b> \u2014 QUIC \u603B\u5F00\u5173\uFF0C\u9ED8\u8BA4 REJECT\uFF08\u6D4F\u89C8\u5668\u81EA\u52A8\u56DE\u9000 TCP\uFF09\uFF0C\u4E2A\u522B App \u8981\u7528\u5C31\u5207 DIRECT\u3002<br>
-        \u5957\u5A03\u7EBF\u8DEF\u8D85\u65F6\u6216\u843D\u5730\u6302\u4E86\uFF0C\u5207${s.zeroTrust ? "ZT\u56E2\u961F\u8FB9\u7F18\u6216" : ""}WARP\u76F4\u8FDE\u9876\u4E0A\u3002
+        <b>\u{1F3AC} \u6D41\u5A92\u4F53</b> \u2014 \u89C6\u9891/\u6D4B\u901F\u4E13\u7528\u51FA\u53E3\uFF0C\u548C\u5237\u7F51\u9875\u7684\u6D41\u5206\u5F00\u62E8\u4E0D\u540C\u63A5\u5165\u70B9\u3002<br>
+        &nbsp;&nbsp;<b>YouTube \u6253\u4E0D\u5F00 / \u4E00\u76F4\u8F6C\u5708\u5C31\u5207\u8FD9\u4E2A\u7EC4</b>\uFF1A\u9ED8\u8BA4\u8D70\u300C\u{1F3AC} \u6D41\u5A92\u4F53\u81EA\u52A8\u300D\uFF0C
+        \u8FD8\u4E0D\u884C\u5C31\u5F80\u4E0B\u5207\u6210 Proton\u7EBF\u8DEF / Windscribe\u7EBF\u8DEF \u6362\u4E2A\u51FA\u53E3 IP
+        \uFF08CF \u7684 IP \u88AB Google \u5224\u6210\u673A\u623F\u65F6\u53EA\u6709\u6362\u51FA\u53E3\u80FD\u6551\uFF09\u3002<br>
+        <b>\u{1F6AB} QUIC</b> \u2014 QUIC \u603B\u5F00\u5173\u3002\u56FD\u5185\u57DF\u540D\u7684 QUIC \u5DF2\u81EA\u52A8\u653E\u884C\u76F4\u8FDE\uFF0C\u4E0D\u7528\u7BA1\uFF1B
+        \u53EA\u5269\u5883\u5916 QUIC \u5F52\u8FD9\u4E2A\u7EC4\uFF0C\u9ED8\u8BA4 REJECT\uFF08App \u4F1A\u7ACB\u523B\u56DE\u9000 TCP\uFF09\u3002<br>
+        &nbsp;&nbsp;\u67D0\u4E2A\u5883\u5916 App \u4E00\u76F4\u8F6C\u5708\u3001\u522B\u7684\u90FD\u6B63\u5E38\uFF0C\u628A\u5B83\u5207\u6210 DIRECT \u8BD5\u4E00\u6B21 \u2014\u2014
+        \u80FD\u597D\u5C31\u662F\u90A3\u4E2A App \u4E0D\u80AF\u653E\u5F03 QUIC\u3002<br>
+        \u5957\u5A03\u7EBF\u8DEF\u8D85\u65F6\u6216\u843D\u5730\u6302\u4E86\uFF0C\u5207${s.zeroTrust ? "ZT\u56E2\u961F\u8FB9\u7F18\u6216" : ""}WARP\u76F4\u8FDE\u9876\u4E0A\u3002<br>
+        <b>\u624B\u673A\u7AEF\u63D0\u793A</b>\uFF1A\u624B\u673A\u4E0A\u5E76\u53D1\u6D4B\u901F\u4F1A\u88AB\u7CFB\u7EDF\u9650\u5236\uFF0C\u6240\u4EE5\u300C\u267B\uFE0F \u81EA\u52A8\u9009\u62E9\u300D\u548C
+        \u300C\u{1F3AC} \u6D41\u5A92\u4F53\u81EA\u52A8\u300D\u53EA\u6D4B\u7CBE\u9009\u7684 4 \u4E2A\u7AEF\u53E3\uFF08\u7EA6 20 \u4E2A\u63A5\u5165\u70B9\uFF09\uFF1B\u8981\u5168\u91CF 7 \u7AEF\u53E3\u7684
+        \u5728\u300CWARP\u76F4\u8FDE\u300D\u91CC\u624B\u9009\uFF08\u90A3\u4E00\u7EC4\u662F\u6309\u9700\u6D4B\u901F\uFF0C\u5207\u8FC7\u53BB\u624D\u5F00\u6D4B\uFF09\u3002
       </div>
       <div id="msg"></div>
     </div>
