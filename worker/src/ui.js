@@ -1,3 +1,5 @@
+import { MAX_EXTRA_DEVICES } from "./config.js";
+
 // 界面沿用 cfnew 的赛博朋克终端风：青/品红霓虹、等宽字体、扫描线。
 const CSS = `
 :root{
@@ -221,6 +223,30 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
     ? `${gb(windUsage.used)} / ${gb(windUsage.max)}（${windPct}%）` : null;
   const pLeft = pExp ? Math.floor((pExp.getTime() - Date.now()) / 86400000) : null;
 
+  // ---- 设备存活体检：把「哪台设备还活着」摊开给用户看 ----
+  // 免费边缘那几十个节点全挂在一台设备的一把密钥上，那台被 CF 删掉整族
+  // 就一起死。界面必须能直接把这台指出来，而不是让用户对着一片超时猜。
+  // ok 是三态：true 活着 / false 被 CF 删除 / null 没法校验。
+  const diagItems = (s.diag && Array.isArray(s.diag.items)) ? s.diag.items : [];
+  const diagAt = (s.diag && s.diag.at) ? new Date(s.diag.at) : null;
+  const diagAgo = diagAt ? Math.floor((Date.now() - diagAt.getTime()) / 60000) : null;
+  const diagMap = {};
+  diagItems.forEach((it) => { diagMap[it.role] = it; });
+  const tone = (ok) => ok === true ? "color:var(--mint)"
+    : ok === false ? "color:var(--red)"
+    : ok === null ? "color:var(--yellow)" : "color:var(--dim)";
+  const word = (ok) => ok === true ? "✓ 活着"
+    : ok === false ? "✗ 已被 CF 删除"
+    : ok === null ? "? 没法校验"
+    : "未体检";
+  const devRows = [];
+  if (warp.deviceId) devRows.push({ role: "免费 WARP（主力）", d: warp });
+  (s.warpExtras || []).forEach((d, i) =>
+    devRows.push({ role: "免费 WARP（备胎 " + (i + 1) + "）", d: d || {} }));
+  if (ztDevice && ztDevice.deviceId) {
+    devRows.push({ role: "Zero Trust 团队设备", d: ztDevice });
+  }
+
   const row = (k, v, cls = "") =>
     `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
 
@@ -354,7 +380,11 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         节点名 <b>欧洲1@198.1-443</b> = 欧洲第 1 个落地，经 162.159.198.1:443 接入。<br>
         <b>ZT-</b> 开头的是 Zero Trust 团队边缘（162.159.197.x），用团队密钥；
         其余接入点用免费 WARP 密钥。<b>两族并存</b>，一族整体连不上时另一族照常工作 ——
-        用 ⚡ 聚合WARP / ⚡ 聚合ZT 切开测一下延迟，就知道是哪一族的问题。
+        用 ⚡ 聚合WARP / ⚡ 聚合ZT 切开测一下延迟，就知道是哪一族的问题。<br>
+        <b>数量对不上就是导入的旧配置</b>：本份应有免费边缘 ${stat.freeEdges || 0} 个、
+        ZT 团队边缘 ${stat.teamEdges || 0} 个接入点${stat.extraEdges ? `、备胎 ${stat.extraEdges} 个` : ""}。
+        客户端里只看到 4 个 ZT 节点（或免费节点明显少一截），
+        就是配置没更新 —— 回上面重新复制订阅链接、导入一次即可。
       </div>
     </div>
 
@@ -392,6 +422,57 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         两份 WARP 设备都存在 KV 里复用，<b>一般不用重注册</b>。免费边缘那一族整体
         连不上时才点「重注册免费 WARP」——它只换免费那份，<b>Zero Trust 那份不动</b>。<br>
         Zero Trust 要换设备得点「清除 ZT」再粘一份新 JWT（JWT 只有 60 秒寿命，不能静默重注册）。
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">设备存活体检 · 给「整族节点全死」定位</div>
+      ${devRows.map((r) => {
+        const d = r.d, it = diagMap[r.role] || null;
+        const id = d.deviceId ? " · " + d.deviceId.slice(0, 8) + "…" : "";
+        const ip = d.ipv4 ? " · " + d.ipv4 : "";
+        return `<div class="row"><span class="k">${r.role}</span>` +
+          `<span class="v" style="${tone(it ? it.ok : undefined)}">` +
+          `${word(it ? it.ok : undefined)}${id}${ip}</span></div>`;
+      }).join("")}
+      ${devRows.length ? "" :
+        '<div class="row"><span class="k">设备</span>' +
+        '<span class="v" style="color:var(--yellow)">KV 里一台设备都没有，' +
+        '回上面「操作」点刷新生成</span></div>'}
+      ${diagItems.length ? `
+      <div class="note" style="margin-top:12px">
+        <b>最近一次体检</b>（${diagAgo <= 0 ? "刚刚" : diagAgo + " 分钟前"}）：<br>
+        ${diagItems.map((it) =>
+          `· ${it.role} — <b style="${tone(it.ok)};font-weight:400">${word(it.ok)}</b>` +
+          (it.error ? `（${it.error}）` : "")).join("<br>")}
+      </div>` : ""}
+      <div class="sub" style="margin-top:12px">
+        <button onclick="go('/api/diag')">设备体检</button>
+        <button class="gh" onclick="go('/api/warp/repair')">一键修复免费族</button>
+        <button class="gh" onclick="go('/api/warp/rekey')">重装免费密钥</button>
+        <button class="gh" onclick="go('/api/warp/add')">＋ 备胎</button>
+        <button class="gh" onclick="go('/api/warp/remove')">− 备胎</button>
+      </div>
+      <div class="note">
+        <b>为什么整族会一起死</b>：免费边缘那 ${stat.freeEdges || 0} 个节点
+        <b>共用同一台设备的一把密钥</b>。那台设备被 CF 删除或吊销时，整族瞬间全死 ——
+        客户端只会显示一片超时，看起来就是「WARP 节点全死了、只剩 ZT 能用」。
+        备胎存在的意义就是给这一族上冗余：主力挂了，备胎的节点还在
+        「♻️ 自动选择」的测速池里，不会整族全红。<br>
+        <b>「设备体检」</b>：拿 device token 去 CF 问「这台设备还在吗」。
+        <b>只能查出密钥作不作数，查不出某个接入点通不通</b> ——
+        Worker 没有 UDP 出站，跑不了 QUIC，替客户端做不了真实握手。
+        所以别拿体检结果当测速结论。<br>
+        <b>「一键修复免费族」</b>：把被 CF 删掉的免费设备（主力 + 备胎）静默重注册换新，
+        还活着的原样不动。Zero Trust 那份修不了 —— 重注册要一个新的 60 秒 JWT，
+        得回下面「Zero Trust」区块粘一份。<br>
+        <b>「重装免费密钥」</b>：设备在 CF 那边还活着、但本地这把密钥认证不过时用。
+        不换 deviceId，比重新注册温和。客户端报
+        <code>CRYPTO_ERROR 0x131 (remote): tls: access denied</code> 就是这种。<br>
+        <b>「＋ / − 备胎」</b>：加减免费备胎（另一个账号、另一把密钥），最多 ${MAX_EXTRA_DEVICES} 台。
+        当前 ${stat.extraDevices || 0} 台、${stat.extraEdges || 0} 个接入点。
+        备胎只出 443 / 8095 两个端口，且只有前 2 台进自动测速池 ——
+        手机上每多一个成员就多一次并发 QUIC 握手，池子必须压住。
       </div>
     </div>
 

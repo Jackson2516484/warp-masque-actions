@@ -186,11 +186,11 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   const solo = buildConfig(null, opera, null, null, ztDev);
   const gsSolo = [...solo.yaml.matchAll(/^  - name: (.+)$/gm)].map((m) => m[1]);
   t("ZT 标记为启用", solo.zeroTrust === true);
-  t(`团队边缘 ${solo.teamEdges} 个 (2 IP x 2 端口)`, solo.teamEdges === 4);
+  t(`团队边缘 ${solo.teamEdges} 个 (2 IP x 7 端口)`, solo.teamEdges === 14);
   t("有 ZT团队边缘 组", gsSolo.includes("ZT团队边缘"));
   t("只有 ZT 时不出 WARP直连 组", !gsSolo.includes("WARP直连"));
   t("只有 ZT 时不出 ⚡ 聚合WARP 组", !gsSolo.includes("⚡ 聚合WARP"));
-  t(`只有 ZT 时接入点就 ${solo.entries} 个`, solo.entries === 4);
+  t(`只有 ZT 时接入点就 ${solo.entries} 个`, solo.entries === 14);
   // 关键：ZT 密钥绝不能拿去生成免费边缘节点，那 57 个全是死节点
   t("只有 ZT 时不生成 198/199 节点", !/server: 162\.159\.19[89]/.test(solo.yaml));
   const selSolo = solo.yaml.split("  - name: 🚀 节点选择")[1].split("\n  - name:")[0];
@@ -199,7 +199,7 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   // ---- 兼容老调用：把 ZT 设备当 warp 传 ----
   const legacy = buildConfig(ztDev, opera);
   t("ZT 设备当 warp 传也能识别",
-    legacy.zeroTrust === true && legacy.teamEdges === 4 && legacy.entries === 4);
+    legacy.zeroTrust === true && legacy.teamEdges === 14 && legacy.entries === 14);
 
   // ---- 两份并存 ----
   const proton = {
@@ -216,10 +216,10 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   const entryNames = [...y.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
   const nodeBlock = (n) => y.split(`  - name: ${n}\n`)[1].split("\n  - name:")[0];
 
-  t(`并存时接入点 ${both.entries} 个 (免费 57 + ZT 4)`, both.entries === 61);
+  t(`并存时接入点 ${both.entries} 个 (免费 57 + ZT 14)`, both.entries === 71);
   t(`免费边缘 ${both.freeEdges} 个`, both.freeEdges === 57);
-  t(`团队边缘 ${both.teamEdges} 个`, both.teamEdges === 4);
-  t(`组合 ${both.combos} 个 (61 x 2)`, both.combos === 122);
+  t(`团队边缘 ${both.teamEdges} 个`, both.teamEdges === 14);
+  t(`组合 ${both.combos} 个 (71 x 2)`, both.combos === 142);
   t("三族的直连组都在",
     gs.includes("ZT团队边缘") && gs.includes("WARP直连"));
   t("三个聚合组都在",
@@ -238,10 +238,30 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
 
   // 团队边缘节点必须是 197.x + 带 ZT SNI
   const ztEntries = entryNames.filter((n) => n.startsWith("ZT-"));
-  t(`ZT- 前缀节点 ${ztEntries.length} 个`, ztEntries.length === 4);
+  t(`ZT- 前缀节点 ${ztEntries.length} 个`, ztEntries.length === 14);
   t("团队边缘走 197.x", nodeBlock("ZT-197.1-443").includes("162.159.197"));
   t("团队边缘用 zt-masque SNI",
     nodeBlock("ZT-197.1-443").includes("zt-masque.cloudflareclient.com"));
+
+  // ZT 必须覆盖官方防火墙文档列出的全部回退端口。用户报「ZT 只有两个能用」
+  // 的直接原因就是这里只有 443/8443 —— 一个端口被链路掐掉就塌一半。
+  // 文档：MASQUE ingress 162.159.197.0/24，默认 443，回退
+  // 500 / 1701 / 4500 / 4443 / 8443 / 8095。
+  for (const port of [443, 500, 1701, 4500, 4443, 8443, 8095]) {
+    t(`ZT 有 ${port} 端口节点`,
+      ztEntries.includes(`ZT-197.1-${port}`) && ztEntries.includes(`ZT-197.2-${port}`));
+  }
+
+  // 免费族的「官方域名」节点曾经误用团队版 SNI（zt-masque），
+  // 消费版密钥配团队版 SNI 边缘直接拒绝 —— 那个节点是恒死的。
+  // 两族 SNI 分工必须清楚：消费版 -> consumer-masque，团队版 -> zt-masque。
+  const official = nodeBlock("官方域名");
+  t("官方域名节点用消费版 SNI",
+    official.includes("consumer-masque.cloudflareclient.com"));
+  t("官方域名节点没用团队版 SNI", !official.includes("zt-masque.cloudflareclient.com"));
+  // 免费边缘其余节点不写 sni，靠 mihomo 默认值（就是 consumer-masque）
+  t("免费边缘节点不误写团队 SNI",
+    !nodeBlock("198.1-443").includes("cloudflareclient.com"));
 
   // 节点选择里三族都能选到
   const sel = y.split("  - name: 🚀 节点选择")[1].split("\n  - name:")[0];
@@ -252,7 +272,7 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   // ZT团队边缘 组成员都是 ZT- 节点，不能混进免费边缘
   const ztGroup = y.split("  - name: ZT团队边缘")[1].split("\n  - name:")[0];
   const ztMembers = [...ztGroup.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
-  t(`ZT组 ${ztMembers.length} 个成员`, ztMembers.length === 4);
+  t(`ZT组 ${ztMembers.length} 个成员`, ztMembers.length === 14);
   t("ZT组成员都是 ZT- 前缀", ztMembers.every((m) => m.startsWith("ZT-")));
   t("ZT组成员都在 proxies 里", ztMembers.every((m) => entryNames.includes(m)));
 
@@ -284,11 +304,11 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   // 聚合组只收 IPv4 接入点，混进 v6 在纯 IPv4 机器上会 network is unreachable
   const agg = y.split("  - name: ⚡ 聚合\n")[1].split("\n  - name:")[0];
   const aggM = [...agg.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
-  t(`聚合 ${aggM.length} 个成员 = 免费29 + ZT4`,
-    aggM.length === 33 && aggM.every((m) => !m.startsWith("v6-") && entryNames.includes(m)));
+  t(`聚合 ${aggM.length} 个成员 = 免费29 + ZT14`,
+    aggM.length === 43 && aggM.every((m) => !m.startsWith("v6-") && entryNames.includes(m)));
   const aggZt = y.split("  - name: ⚡ 聚合ZT\n")[1].split("\n  - name:")[0];
   const aggZtM = [...aggZt.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
-  t("⚡ 聚合ZT 只收 ZT 节点", aggZtM.length === 4 && aggZtM.every((m) => m.startsWith("ZT-")));
+  t("⚡ 聚合ZT 只收 ZT 节点", aggZtM.length === 14 && aggZtM.every((m) => m.startsWith("ZT-")));
   const aggWarp = y.split("  - name: ⚡ 聚合WARP\n")[1].split("\n  - name:")[0];
   const aggWarpM = [...aggWarp.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
   t(`⚡ 聚合WARP 只收免费边缘 ${aggWarpM.length} 个`,
@@ -478,6 +498,91 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
     dupRules.length === 0);
 }
 
+// ---- 备用免费设备（备胎）：同一族里多把密钥，主力被 CF 清掉还有活的 ----
+// 起因：用户报「warp 的节点全死了，只有 ZT 两个能用」。免费族 57 个节点
+// 全挂在**同一把密钥**上，那台设备一旦被 CF 删除/吊销，整族瞬间全死，
+// 客户端只能看到一片超时。备胎就是给这一族加冗余。
+{
+  const ztDev = {
+    privateKey: "ZTKEY", peerPublicKey: "ZTPUB",
+    ipv4: "172.16.0.9", ipv6: "2606:4700:110::9",
+    deviceId: "z", registeredAt: new Date().toISOString(),
+    zeroTrust: true, accountType: "team",
+  };
+  const alt1 = { ...warp, privateKey: "ALT1_PRIV", peerPublicKey: "ALT1_PUB",
+                 ipv4: "172.16.1.2", ipv6: "2606:4700:110:1::2", deviceId: "a1" };
+  const alt2 = { ...warp, privateKey: "ALT2_PRIV", peerPublicKey: "ALT2_PUB",
+                 ipv4: "172.16.2.2", ipv6: "2606:4700:110:2::2", deviceId: "a2" };
+
+  const r = buildConfig(warp, opera, null, null, ztDev, [alt1, alt2]);
+  const yy = r.yaml;
+  const names = [...yy.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
+  const nb = (n) => yy.split(`  - name: ${n}\n`)[1].split("\n  - name:")[0];
+  const mem = (g) => [...yy.split(`  - name: ${g}\n`)[1].split("\n  - name:")[0]
+    .matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+
+  t(`备胎台数 ${r.extraDevices}`, r.extraDevices === 2);
+  t(`备胎节点 ${r.extraEdges} 个 (2 台 x 8)`, r.extraEdges === 16);
+  t("主力接入点数没被备胎污染", r.freeEdges === 57);
+  t("备胎节点带 W2-/W3- 前缀",
+    names.includes("W2-198.1-443") && names.includes("W3-199.2-8095"));
+  t("备胎用各自的密钥",
+    nb("W2-198.1-443").includes("private-key: ALT1_PRIV") &&
+    nb("W3-198.1-443").includes("private-key: ALT2_PRIV"));
+
+  // 三把密钥互不相同。串了就等于没有冗余
+  const keys = ["198.1-443", "W2-198.1-443", "W3-198.1-443"]
+    .map((n) => (nb(n).match(/private-key: (\S+)/) || [])[1]);
+  t(`主力/备胎三把密钥互不相同 (${keys.join("/")})`, new Set(keys).size === 3);
+  t("备胎密钥没混进 ZT 族",
+    names.filter((n) => n.startsWith("ZT-")).every((n) => !nb(n).includes("ALT")));
+
+  // 备胎只出 443 / 8095，不出全量端口、不出 v6、不出官方域名
+  t("备胎只出 443 / 8095",
+    names.includes("W2-198.1-443") && names.includes("W2-198.1-8095") &&
+    !names.includes("W2-198.1-500") && !names.includes("W2-198.1-4443"));
+  t("备胎不出 v6 节点", !names.some((n) => /^W\d-v6-/.test(n)));
+  t("备胎不出官方域名节点", !names.includes("W2-官方域名"));
+
+  // 自动优选必须横跨三族 —— 这是本轮的核心：主力一死，池子里还有活的
+  const pick = mem("♻️ 自动选择");
+  t(`自动选择 ${pick.length} 个成员（含备胎）`, pick.length > 0);
+  t("自动选择覆盖主力免费设备", pick.some((m) => /^19[89]\.1-/.test(m)));
+  t("自动选择覆盖备胎", pick.some((m) => m.startsWith("W2-")));
+  t("自动选择覆盖 ZT 团队边缘", pick.some((m) => m.startsWith("ZT-")));
+  t("自动选择池子压在 41 以内（手机测速预算）", pick.length <= 41);
+
+  // 族级组要把备胎算进去
+  t("聚合WARP 含备胎", mem("⚡ 聚合WARP").some((m) => m.startsWith("W2-")));
+  const wg = mem("WARP直连");
+  t(`WARP直连 ${wg.length} 个 = 主力 57 + 备胎 16`,
+    wg.length === 73 && wg.some((m) => m.startsWith("W3-")));
+  t("WARP直连 不含 ZT 节点", wg.every((m) => !m.startsWith("ZT-")));
+
+  // 主力注册失败时，光靠备胎也要能出一份能用的配置
+  const onlyAlt = buildConfig(null, opera, null, null, null, [alt1]);
+  t(`没有主力设备时靠备胎也能生成 ${onlyAlt.entries} 个接入点`, onlyAlt.entries === 8);
+  t(`只有备胎时组合 ${onlyAlt.combos} 个 (8 x 2)`, onlyAlt.combos === 16);
+  t("只有备胎时有 WARP直连 组", onlyAlt.yaml.includes("  - name: WARP直连\n"));
+
+  // 带 zeroTrust 标记的设备塞进备胎数组要被忽略（那是 ZT，不是备胎）
+  const bad = buildConfig(warp, opera, null, null, null, [{ ...alt1, zeroTrust: true }]);
+  t("ZT 设备混进备胎数组被忽略", bad.extraDevices === 0 && bad.extraEdges === 0);
+  // 没有 privateKey 的残废设备也要被丢掉，不能生成空壳节点
+  const junk = buildConfig(warp, opera, null, null, null,
+    [{ privateKey: "", ipv4: "1.1.1.1" }]);
+  t("残废备胎设备被丢掉", junk.extraDevices === 0);
+
+  // 上限 3 台；第 3 台之后不进精选池（保护手机测速预算）
+  const many = buildConfig(warp, opera, null, null, null,
+    [alt1, alt2, { ...alt1, privateKey: "A3" }, { ...alt1, privateKey: "A4" }]);
+  t("备胎上限 3 台", many.extraDevices === 3);
+  const manyPick = [...many.yaml
+    .split("  - name: ♻️ 自动选择\n")[1].split("\n  - name:")[0]
+    .matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  t("第 3 台备胎不进自动测速池",
+    manyPick.some((m) => m.startsWith("W3-")) && !manyPick.some((m) => m.startsWith("W4-")));
+}
+
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);
-

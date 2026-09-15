@@ -10,9 +10,9 @@
 //      前者出免费边缘 198/199 那族，后者出团队边缘 197.x 那族。
 //      两套密钥在 CF 那边分开认证，谁也顶替不了谁，所以两份都要留着。
 //   3. 首次访问引导设密码，之后订阅路径、改密码都在界面里做
-import { registerWarp } from "./warp.js";
+import { registerWarp, verifyDevice, reenrollMasque } from "./warp.js";
 import { fetchOpera } from "./opera.js";
-import { buildConfig } from "./config.js";
+import { buildConfig, MAX_EXTRA_DEVICES } from "./config.js";
 import { parseBlob } from "./proton.js";
 import { fetchWindscribe, fetchSession } from "./windscribe.js";
 import { renderUI, renderLogin, renderSetup, renderNoKV } from "./ui.js";
@@ -22,7 +22,9 @@ import {
 } from "./auth.js";
 
 const K_WARP = "warp:device";     // WARP 注册信息，长期复用
+const K_WARP_X = "warp:devices:extra";  // 备用免费设备（备胎），数组
 const K_ZT = "zt:device";         // Zero Trust 注册信息（团队边缘用），长期复用
+const K_DIAG = "diag:report";     // 最近一次设备体检的结果
 const K_CFG = "config:yaml";      // 聚合配置（套娃线路 + WARP 直连）
 const K_STATE = "state:meta";     // 状态元数据，给 UI 用
 const K_CRED = "auth:cred";       // 密码哈希 + 盐
@@ -90,6 +92,22 @@ async function getWind(env) {
   return await fetchWindscribe(acc);
 }
 
+/** 读备用免费设备（备胎）。
+ *
+ * 免费边缘那 57 个节点全挂在**同一把密钥**上，那台设备被 CF 删除/吊销时
+ * 整族瞬间全死 —— 用户看到的就是「warp 的节点全死了，只剩 ZT 能用」。
+ * 备胎是另一台免费设备（另一个账号、另一把密钥），加进来给这一族做冗余。
+ *
+ * 残缺的记录一律丢掉：宁可少一台备胎，也不能把空壳设备喂给生成器
+ * 配出一堆永远连不上的节点。 */
+async function getExtraWarps(env) {
+  const arr = await env.KV.get(K_WARP_X, "json");
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .filter((d) => d && d.privateKey && d.ipv4 && !d.zeroTrust)
+    .slice(0, MAX_EXTRA_DEVICES);
+}
+
 /** 重建配置。WARP 复用，Opera 每次重取（凭据会过期）。
  *
  * 两份 WARP 注册**并存**，不是二选一：
@@ -136,9 +154,12 @@ async function rebuild(env, { forceWarp = false } = {}) {
   } catch (e) {
     windErr = e.message;
   }
+  // 备用免费设备（备胎）。拿不到就是空数组，不影响主力那台。
+  const extras = await getExtraWarps(env);
   const { yaml, entries, landings, combos, proton: pn, wind: wn,
-          zeroTrust: ztFlag, teamEdges, freeEdges } =
-    buildConfig(warp, opera, proton, wind, ztDev);
+          zeroTrust: ztFlag, teamEdges, freeEdges,
+          extraDevices, extraEdges } =
+    buildConfig(warp, opera, proton, wind, ztDev, extras);
 
   const now = Date.now();
   const devInfo = (d) => d ? {
@@ -154,14 +175,19 @@ async function rebuild(env, { forceWarp = false } = {}) {
     updatedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + TTL_MS).toISOString(),
     stats: { entries, landings, combos, proton: pn || 0, wind: wn || 0,
-             teamEdges: teamEdges || 0, freeEdges: freeEdges || 0 },
+             teamEdges: teamEdges || 0, freeEdges: freeEdges || 0,
+             extraDevices: extraDevices || 0, extraEdges: extraEdges || 0 },
     protonExpiresAt: proton ? proton.expiresAt : null,
     wind: wind ? { userId: wind.account.userId, servers: wn || 0 } : null,
     windErr,
     zeroTrust: ztFlag,
     warpErr,
     warp: devInfo(warp),
+    // 备胎列表（不含密钥，只给 UI 显示用）
+    warpExtras: extras.map(devInfo),
     zt: devInfo(ztDev),
+    // 最近一次设备体检结果。没体检过就是 null。
+    diag: await env.KV.get(K_DIAG, "json"),
   };
 
   await env.KV.put(K_CFG, yaml);
@@ -498,6 +524,170 @@ export default {
       } catch (e) {
         return json({ ok: false, error: e.message }, 500);
       }
+    }
+
+    // ---- 设备体检 ----
+    // 正面回答「为什么整族节点全死了」：拿 device token 去 CF 问一句
+    // 「这台设备还在吗」。设备被删/被吊销时 `GET /reg/{id}` 回 401/404，
+    // 而客户端那边只会显示一片超时 —— 看起来就是「节点全死了」。
+    //
+    // 能查的只有「密钥还作不作数」，**查不了某个接入点通不通**：
+    // Workers 没有 UDP 出站，跑不了 QUIC，没法替客户端做真实的 MASQUE
+    // 握手。所以别把这个结果当成「哪个节点快」。
+    if (path === "/api/diag" && req.method === "POST") {
+      const warp = await env.KV.get(K_WARP, "json");
+      const ztDev = await env.KV.get(K_ZT, "json");
+      const extras = await getExtraWarps(env);
+
+      const roles = [
+        warp ? { role: "免费 WARP（主力）", dev: warp } : null,
+        ...extras.map((d, i) => ({ role: `免费 WARP（备胎 ${i + 1}）`, dev: d })),
+        ztDev ? { role: "Zero Trust 团队设备", dev: ztDev } : null,
+      ].filter(Boolean);
+
+      if (!roles.length) {
+        return json({ ok: false, error: "KV 里一台设备都没有，先注册" }, 400);
+      }
+
+      const items = [];
+      for (const r of roles) {
+        const v = await verifyDevice(r.dev);
+        items.push({
+          role: r.role,
+          deviceId: r.dev.deviceId || "",
+          ipv4: r.dev.ipv4 || "",
+          registeredAt: r.dev.registeredAt || "",
+          accountType: v.accountType || r.dev.accountType || "",
+          // ok: true 活着 / false 被删 / null 查不了（没有 token）
+          ok: v.ok, error: v.error || "",
+        });
+      }
+
+      const report = { at: new Date().toISOString(), items };
+      await env.KV.put(K_DIAG, JSON.stringify(report));
+      // 顺手并进 state：体检本身不重建配置（重建要重新拉 Opera 凭据，
+      // 代价大且没必要），但管理页读的是 K_STATE，不写进去刷新后看不到。
+      // state 可能还不存在（KV 全新、还没生成过订阅）—— 那就先建个壳，
+      // 否则刷新后一样看不到体检结果。重建时 rebuild() 会从 K_DIAG 把它读回来。
+      const meta = (await env.KV.get(K_STATE, "json")) || {};
+      meta.diag = report;
+      await env.KV.put(K_STATE, JSON.stringify(meta));
+
+      const dead = items.filter((x) => x.ok === false);
+      const unknown = items.filter((x) => x.ok === null);
+      return json({
+        ok: true, report,
+        msg: dead.length
+          ? `${dead.map((d) => d.role).join("、")} 已被 CF 删除或吊销 —— ` +
+            "这就是整族节点全死的原因。免费那几台可以点「一键修复」自动换新；" +
+            "Zero Trust 那份要回下面粘一份新 JWT。"
+          : `设备都正常${unknown.length ? `（${unknown.length} 台没法校验，见下表）` : ""}。` +
+            "如果客户端里还是有节点连不上，那就是链路/端口层面的问题，" +
+            "不是设备凭据：换个端口（4443 / 8443 / 8095）或用 ZT 族试。",
+      });
+    }
+
+    // ---- 一键修复：把被 CF 删掉的免费设备换新 ----
+    // 免费设备（主力 + 备胎）能静默重注册，因为它们走匿名 API，不需要 JWT。
+    // Zero Trust 那份不行 —— 重注册要一个新的 60 秒 JWT，只能提示用户重粘。
+    if (path === "/api/warp/repair" && req.method === "POST") {
+      const out = [];
+
+      let warp = await env.KV.get(K_WARP, "json");
+      if (warp) {
+        const v = await verifyDevice(warp);
+        if (v.ok === false) {
+          try {
+            warp = await registerWarp("cf-worker");
+            await env.KV.put(K_WARP, JSON.stringify(warp));
+            out.push(`免费主力已换新（原来那台：${v.error}）`);
+          } catch (e) {
+            out.push(`免费主力换新失败：${e.message}`);
+          }
+        } else if (v.ok === true) {
+          out.push("免费主力还活着，没动它");
+        } else {
+          out.push(`免费主力没法校验：${v.error}`);
+        }
+      }
+
+      const extras = await getExtraWarps(env);
+      if (extras.length) {
+        const kept = [];
+        for (const d of extras) {
+          const v = await verifyDevice(d);
+          if (v.ok === false) {
+            try {
+              kept.push(await registerWarp("cf-worker-backup"));
+              out.push(`备胎 ${(d.deviceId || "").slice(0, 8)}… 已换新`);
+            } catch (e) {
+              out.push(`备胎换新失败：${e.message}`);
+            }
+          } else {
+            kept.push(d);
+          }
+        }
+        await env.KV.put(K_WARP_X, JSON.stringify(kept));
+      }
+
+      let st = null;
+      try { st = await rebuild(env); }
+      catch (e) { return json({ ok: false, msg: out.join("；"), error: e.message }, 500); }
+
+      return json({ ok: true, msg: out.join("；") +
+        `。已重建：免费边缘 ${st.stats.freeEdges} 个` +
+        (st.stats.extraEdges ? ` + 备胎 ${st.stats.extraEdges} 个` : "") });
+    }
+
+    // ---- 给免费主力设备重装一把 MASQUE 密钥 ----
+    // 用在「设备在 CF 那边还活着，但本地这把密钥认证不过」的情况。
+    // 客户端会报 `CRYPTO_ERROR 0x131 (remote): tls: access denied`，
+    // 整族节点全死。重装密钥不换 deviceId，比重新注册温和。
+    if (path === "/api/warp/rekey" && req.method === "POST") {
+      const warp = await env.KV.get(K_WARP, "json");
+      if (!warp) return json({ ok: false, error: "还没有免费设备，先点刷新生成" }, 400);
+      if (!warp.token) {
+        return json({ ok: false, error: "这台设备没有 device token，没法重装密钥，只能重新注册" }, 400);
+      }
+      try {
+        const upd = await reenrollMasque(warp, "cf-worker");
+        await env.KV.put(K_WARP, JSON.stringify(upd));
+        const st = await rebuild(env);
+        return json({ ok: true,
+          msg: `已给免费主力重装 MASQUE 密钥并重建（免费边缘 ${st.stats.freeEdges} 个）` });
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 500);
+      }
+    }
+
+    // ---- 增加 / 移除备用免费设备 ----
+    // 备胎是另一台免费设备（另一个账号、另一把密钥）。免费族的节点全挂在
+    // 一把密钥上，加一台备胎就是给这一族上冗余：主力被 CF 清掉时，
+    // 「♻️ 自动选择」里还有备胎的节点能测到，不至于整族全红。
+    if (path === "/api/warp/add" && req.method === "POST") {
+      const extras = await getExtraWarps(env);
+      if (extras.length >= MAX_EXTRA_DEVICES) {
+        return json({ ok: false,
+          error: `最多 ${MAX_EXTRA_DEVICES} 台备胎。再多收益很小，只会把订阅撑大。` }, 400);
+      }
+      try {
+        extras.push(await registerWarp(`cf-worker-backup${extras.length + 1}`));
+        await env.KV.put(K_WARP_X, JSON.stringify(extras));
+        const st = await rebuild(env);
+        return json({ ok: true,
+          msg: `备胎 +1（共 ${extras.length} 台，${st.stats.extraEdges} 个接入点）` });
+      } catch (e) {
+        return json({ ok: false, error: `注册备胎失败：${e.message}` }, 500);
+      }
+    }
+
+    if (path === "/api/warp/remove" && req.method === "POST") {
+      const extras = await getExtraWarps(env);
+      if (!extras.length) return json({ ok: false, error: "现在没有备胎" }, 400);
+      extras.pop();
+      await env.KV.put(K_WARP_X, JSON.stringify(extras));
+      try { await rebuild(env); } catch { /* 重建失败不影响移除本身 */ }
+      return json({ ok: true, msg: `备胎 -1，剩 ${extras.length} 台` });
     }
 
     // 用 Zero Trust 的 Team Token（JWT）注册团队设备。

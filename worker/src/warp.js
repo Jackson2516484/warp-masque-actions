@@ -112,6 +112,99 @@ export async function registerWarp(deviceName = "cf-worker", jwt = "") {
   };
 }
 
+/** 向 CF 校验这台设备**还在不在**。
+ *
+ * 判据是 `GET /reg/{id}` + device token。设备被删掉、被吊销、账号失效时
+ * 会拿到 401/404 —— 这就是「整族节点全死」最常见的成因：设备凭据进了
+ * KV 之后，CF 那边因为长期不用 / 触发风控把它清了，而客户端还在拿旧
+ * 密钥去握手，边缘直接回 `CRYPTO_ERROR 0x131 (remote): tls: access denied`
+ * （见 mihomo transport/masque/masque.go 的 ConnectTunnel 错误分支）。
+ *
+ * 返回 { ok } 三态：
+ *   true  设备在，且能看到 config
+ *   false CF 明确说它没了（401/404）或返回别的错
+ *   null  没法校验（流水线推来的设备不带 token，只有 usque 那份 config）
+ */
+export async function verifyDevice(dev) {
+  if (!dev || !dev.deviceId) return { ok: null, error: "没有 deviceId，无法校验" };
+  if (!dev.token) {
+    return { ok: null,
+      error: "设备是流水线推来的（不带 device token），CF 侧无法校验。" +
+             "要能校验就用管理页「Zero Trust」区块粘一份新 JWT 重新注册一次。" };
+  }
+  let r;
+  try {
+    r = await fetch(`${API}/reg/${dev.deviceId}`, {
+      headers: { ...H, Authorization: `Bearer ${dev.token}` },
+    });
+  } catch (e) {
+    return { ok: null, error: `请求 CF 失败：${e.message}` };
+  }
+  if (!r.ok) {
+    const txt = (await r.text().catch(() => "")).slice(0, 120);
+    return {
+      ok: false, status: r.status,
+      error: r.status === 401 || r.status === 404
+        ? `设备已被 CF 删除或吊销（HTTP ${r.status}）—— 这一族的节点会全部连不上`
+        : `CF 返回 HTTP ${r.status}${txt ? "：" + txt : ""}`,
+    };
+  }
+  let j = {};
+  try { j = await r.json(); } catch { /* 空响应也算活着 */ }
+  const acct = j.account?.account_type || dev.accountType || "";
+  return {
+    ok: true, status: 200,
+    accountType: acct,
+    zeroTrust: String(acct).toLowerCase().includes("team"),
+    // 有 peers 才是可用的 MASQUE 配置。拿不到就当「未知」，别误判成坏
+    hasMasqueKey: Array.isArray(j.config?.peers) ? j.config.peers.length > 0 : null,
+  };
+}
+
+/** 给已存在的设备**重新装一把 MASQUE 密钥**，返回更新后的设备对象。
+ *
+ * 用在「设备在 CF 那边还活着，但本地这把密钥认证不过」的情况。成因有两种：
+ *  1. KV 里那份私钥在写入/读取环节被弄坏（截断、换行、编码）；
+ *  2. 同一台设备被别处重新 enroll 过，旧密钥在 CF 侧已经作废。
+ * 两种表现完全一样：整族节点全死，边缘回 tls: access denied。
+ * 重注册会丢掉 deviceId（换新设备），重装密钥不会 —— 所以先用这个。
+ */
+export async function reenrollMasque(dev, deviceName = "cf-worker") {
+  if (!dev || !dev.deviceId || !dev.token) {
+    throw new Error("这台设备没有 deviceId / token，没法重装密钥，只能重新注册");
+  }
+  // 每台设备每次重装都生成新密钥对，不复用旧的
+  const kp = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const spki = b64(await crypto.subtle.exportKey("spki", kp.publicKey));
+  const pkcs8 = b64(await crypto.subtle.exportKey("pkcs8", kp.privateKey));
+
+  const r = await fetch(`${API}/reg/${dev.deviceId}`, {
+    method: "PATCH",
+    headers: { ...H, Authorization: `Bearer ${dev.token}` },
+    body: JSON.stringify({
+      key: spki, key_type: "secp256r1", tunnel_type: "masque", name: deviceName,
+    }),
+  });
+  if (!r.ok) {
+    throw new Error(`重装密钥失败 ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  }
+  const up = await r.json();
+  const pem = up.config?.peers?.[0]?.public_key || dev.peerPublicKey || "";
+  const peerPub = pem.includes("-----")
+    ? pem.split("\n").filter((l) => l && !l.startsWith("-----")).join("")
+    : pem;
+
+  return {
+    ...dev,
+    privateKey: pkcs8ToSec1(pkcs8),
+    peerPublicKey: peerPub,
+    ipv4: up.config?.interface?.addresses?.v4 || dev.ipv4,
+    ipv6: up.config?.interface?.addresses?.v6 || dev.ipv6,
+    rekeyedAt: new Date().toISOString(),
+  };
+}
+
 /** PKCS8 -> SEC1(RFC 5915)，带 P-256 曲线参数。
  *
  * WebCrypto 只能导出 PKCS8，mihomo 要 SEC1，直接喂会报

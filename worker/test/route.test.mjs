@@ -444,8 +444,8 @@ t("新密码能登上",
   t("state.zt 是 team 设备", st.zt.accountType === "team");
   t("state 标记 ZT 已启用", st.zeroTrust === true);
   t(`state 统计免费边缘 ${st.stats.freeEdges} + 团队边缘 ${st.stats.teamEdges}`,
-    st.stats.freeEdges === 57 && st.stats.teamEdges === 4);
-  t(`state 接入点总数 ${st.stats.entries}`, st.stats.entries === 61);
+    st.stats.freeEdges === 57 && st.stats.teamEdges === 14);
+  t(`state 接入点总数 ${st.stats.entries}`, st.stats.entries === 71);
 
   // 清除只摘团队边缘那一族，免费 WARP 那份不能跟着掉
   const clr = await worker.fetch(post("/api/zt/clear", {}, az), env);
@@ -521,6 +521,191 @@ t("新密码能登上",
   await worker.fetch(raw(`/push/${tk}`, pblob), env);
   t("同一令牌不带后缀走 Proton", !!kv.get("proton:cred"));
   t("两种凭据互不覆盖", !!kv.get("zt:device") && !!kv.get("proton:cred"));
+}
+
+// ---- 设备体检 / 一键修复 / 备胎 ----
+// 起因：用户报「warp 的节点全死了，只有 ZT 两个能用」。免费族 57 个节点全挂在
+// 同一把密钥上，那台设备被 CF 删掉就是整族全死，而客户端只会显示一片超时。
+// 这里补的是：能不能查出**是哪一台设备**死了、能不能一键换新、能不能加备胎。
+{
+  reset();
+  await worker.fetch(post("/api/setup", { password: PW, confirm: PW }), env);
+  const ck = (await worker.fetch(post("/login", { password: PW }), env))
+    .headers.get("set-cookie").split(";")[0];
+  const az2 = { cookie: ck };
+
+  const devPrimary = {
+    deviceId: "dev-primary", token: "tok-p",
+    privateKey: "PK-PRIMARY", peerPublicKey: "PUB-P",
+    ipv4: "172.16.0.2", ipv6: "2606:4700:110::2",
+    registeredAt: new Date().toISOString(), accountType: "free",
+  };
+  const devAlt = {
+    deviceId: "dev-alt1", token: "tok-a1",
+    privateKey: "PK-ALT1", peerPublicKey: "PUB-A1",
+    ipv4: "172.16.1.2", ipv6: "2606:4700:110:1::2",
+    registeredAt: new Date().toISOString(), accountType: "free",
+  };
+  kv.set("warp:device", JSON.stringify(devPrimary));
+  kv.set("warp:devices:extra", JSON.stringify([devAlt]));
+  // ZT 那份是流水线推来的，按设计不带 token —— 体检应该老实说「查不了」
+  kv.set("zt:device", JSON.stringify({
+    deviceId: "zt-1", privateKey: "PK-ZT", peerPublicKey: "PUB-ZT",
+    ipv4: "172.16.0.9", ipv6: "2606:4700:110::9",
+    registeredAt: new Date().toISOString(), zeroTrust: true, accountType: "team",
+  }));
+
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  let regCount = 0;
+  // GET /reg/{id} = 体检；PATCH = 重装密钥；POST /reg = 注册新设备。
+  // 主力活着、备胎已被 CF 删掉 —— 这正是用户遇到的那种「一族全死」。
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url), m = init.method || "GET";
+    if (u.includes("api2.sec-tunnel.com")) {
+      seen.push(`opera ${u.split("/").pop()}`);
+      const path = u.split("/").pop();
+      const body = { status: { code: 0 } };
+      if (path === "register_device") body.data = { device_id: "dev-op" };
+      if (path === "device_generate_password") body.data = { device_password: "pwd" };
+      if (path === "discover") body.data = { ips: [{ ip: "1.2.3.4", port: [443] }] };
+      return new Response(JSON.stringify(body),
+        { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (u.includes("api.cloudflareclient.com")) {
+      if (m === "POST" && u.endsWith("/reg")) {
+        regCount += 1;
+        seen.push(`reg-new-${regCount}`);
+        return new Response(JSON.stringify({
+          id: `dev-new${regCount}`, token: `tok-new${regCount}`,
+          account: { account_type: "free" },
+          config: { interface: { addresses: {
+            v4: `172.16.${regCount}.2`, v6: `2606:4700:110:${regCount}::2` } } },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (m === "PATCH") {
+        seen.push("reenroll");
+        return new Response(JSON.stringify({
+          config: { peers: [{ public_key: "PEER-NEW" }],
+                    interface: { addresses: {
+                      v4: "172.16.0.2", v6: "2606:4700:110::2" } } },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      const id = u.split("/reg/")[1] || "";
+      seen.push(`verify-${id}`);
+      // 备胎那台已经被 CF 删掉
+      if (id.startsWith("dev-alt")) {
+        return new Response("device not found", { status: 404 });
+      }
+      return new Response(JSON.stringify({
+        account: { account_type: "free" },
+        config: { peers: [{ public_key: "PUB-P" }] },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("no mock", { status: 500 });
+  };
+
+  // 未登录打体检接口一律 404（和别的 /api 一样，不泄露路径存在性）
+  t("未登录不能打设备体检",
+    (await worker.fetch(post("/api/diag", {}), env)).status === 404);
+
+  // ---- 体检 ----
+  const dg = await worker.fetch(post("/api/diag", {}, az2), env);
+  const dgj = await dg.json();
+  t("体检返回 ok", dg.status === 200 && dgj.ok);
+  const items = dgj.report.items;
+  t(`体检覆盖 ${items.length} 台设备`, items.length === 3);
+  t("主力设备判为活着", items.find((x) => x.role.includes("主力")).ok === true);
+  const altItem = items.find((x) => x.role.includes("备胎"));
+  t("被删的备胎判为死", altItem.ok === false);
+  t("备胎的失败原因说清是「被删/吊销」", /删除或吊销/.test(altItem.error));
+  t("ZT 设备判为「查不了」而不是「死了」",
+    items.find((x) => x.role.includes("Zero Trust")).ok === null);
+  t("ZT 的说明提到缺 device token",
+    /device token/.test(items.find((x) => x.role.includes("Zero Trust")).error));
+  t("体检结果写回 KV（刷新页面不用重跑）", !!kv.get("diag:report"));
+  const metaAfterDiag = JSON.parse(kv.get("state:meta") || "{}");
+  t("体检结果并进 state，管理页刷新就能看到",
+    !!metaAfterDiag.diag && Array.isArray(metaAfterDiag.diag.items) &&
+    metaAfterDiag.diag.items.length === 3);
+  t("并进 state 的记录里带设备角色和结论",
+    metaAfterDiag.diag.items.some((x) => x.role.includes("主力") && x.ok === true) &&
+    metaAfterDiag.diag.items.some((x) => x.role.includes("备胎") && x.ok === false));
+  t("体检结论直接点名是哪一台", /备胎/.test(dgj.msg));
+
+  // 体检**不能**把设备写坏：只读，不重建
+  t("体检没有重新注册设备", regCount === 0);
+  t("体检没有重建配置", !kv.get("config:yaml"));
+
+  // ---- 一键修复：死掉的备胎换新，活着的主力不动 ----
+  const rp = await worker.fetch(post("/api/warp/repair", {}, az2), env);
+  const rpj = await rp.json();
+  t("修复返回 ok", rp.status === 200 && rpj.ok);
+  t("修复重新注册了 1 台设备", regCount === 1);
+  t("主力没被动（deviceId 不变）",
+    JSON.parse(kv.get("warp:device")).deviceId === "dev-primary");
+  const extras1 = JSON.parse(kv.get("warp:devices:extra"));
+  t("备胎已换成新设备", extras1.length === 1 && extras1[0].deviceId === "dev-new1");
+  t("新备胎用的是新密钥", extras1[0].privateKey.includes("PK") === false ||
+    extras1[0].privateKey !== "PK-ALT1");
+  t("修复会重建配置", !!kv.get("config:yaml"));
+
+  // 重建后 state 要如实反映备胎的节点数（1 台 x 8 个接入点）
+  const st1 = await (await worker.fetch(req("/api/state", { headers: az2 }), env)).json();
+  t(`state 记了备胎台数 ${st1.stats.extraDevices}`, st1.stats.extraDevices === 1);
+  t(`state 记了备胎节点数 ${st1.stats.extraEdges}`, st1.stats.extraEdges === 8);
+  t("state 里备胎设备有明细", Array.isArray(st1.warpExtras) && st1.warpExtras.length === 1);
+  t("备胎明细里不带密钥",
+    !JSON.stringify(st1.warpExtras).includes("PK-"));
+  const cfg1 = kv.get("config:yaml");
+  t("订阅里真的出现了 W2- 前缀的备胎节点", cfg1.includes("W2-198.1-443"));
+  t("订阅里备胎用的是新设备的密钥",
+    cfg1.includes(`private-key: ${extras1[0].privateKey}`));
+  t("订阅里 ZT 团队边缘是 14 个端口节点",
+    (cfg1.match(/name: ZT-197\.1-\d+/g) || []).length === 7);
+
+  // ---- 重装 MASQUE 密钥 ----
+  const rk = await worker.fetch(post("/api/warp/rekey", {}, az2), env);
+  const rkj = await rk.json();
+  t("重装密钥返回 ok", rk.status === 200 && rkj.ok);
+  const afterRekey = JSON.parse(kv.get("warp:device"));
+  t("主力私钥换了一把", afterRekey.privateKey !== "PK-PRIMARY");
+  t("主力 deviceId 没变（没换设备）", afterRekey.deviceId === "dev-primary");
+  t("peer 公钥按 PATCH 结果更新", afterRekey.peerPublicKey === "PEER-NEW");
+  t("重装记录的 rekeyedAt 落库", !!afterRekey.rekeyedAt);
+  t("重装过的密钥进了订阅",
+    kv.get("config:yaml").includes(`private-key: ${afterRekey.privateKey}`));
+
+  // 没有 token 的设备不能重装密钥 —— 必须明说，别静默失败
+  kv.set("warp:device", JSON.stringify({ ...devPrimary, token: undefined }));
+  const rkBad = await worker.fetch(post("/api/warp/rekey", {}, az2), env);
+  t("没有 device token 时重装被拒并说明原因",
+    rkBad.status === 400 && /device token/.test((await rkBad.json()).error));
+  kv.set("warp:device", JSON.stringify(afterRekey));
+
+  // ---- 加 / 删备胎 ----
+  const before = JSON.parse(kv.get("warp:devices:extra")).length;
+  const ad = await worker.fetch(post("/api/warp/add", {}, az2), env);
+  t("加备胎返回 ok", ad.status === 200 && (await ad.json()).ok);
+  t(`备胎 ${before} -> ${JSON.parse(kv.get("warp:devices:extra")).length} 台`,
+    JSON.parse(kv.get("warp:devices:extra")).length === before + 1);
+
+  const rm = await worker.fetch(post("/api/warp/remove", {}, az2), env);
+  t("删备胎返回 ok", rm.status === 200 && (await rm.json()).ok);
+  t("备胎数回落", JSON.parse(kv.get("warp:devices:extra")).length === before);
+
+  // 上限：塞满 3 台后再加要被拒
+  kv.set("warp:devices:extra", JSON.stringify([devAlt, devAlt, devAlt]));
+  const ad2 = await worker.fetch(post("/api/warp/add", {}, az2), env);
+  const ad2j = await ad2.json();
+  t("备胎到上限后拒绝并说明", ad2.status === 400 && /最多 3 台/.test(ad2j.error));
+
+  // 空的备胎列表：删要说清楚，别假装成功
+  kv.set("warp:devices:extra", JSON.stringify([]));
+  const rm2 = await worker.fetch(post("/api/warp/remove", {}, az2), env);
+  t("没有备胎时删被拒", rm2.status === 400);
+
+  globalThis.fetch = realFetch;
 }
 
 console.log(`\n通过 ${pass} 失败 ${fail}`);

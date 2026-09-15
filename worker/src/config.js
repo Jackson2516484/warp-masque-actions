@@ -16,13 +16,33 @@ const PORTS = [443, 500, 1701, 4500, 4443, 8443, 8095];
 // 漏过的冷门口，8443 是通用备选。
 // 全量 7 个端口仍在 WARP直连 / 🎬 流媒体 组里，切过去能手选。
 const PICK_PORTS = [443, 4443, 8443, 8095];
+// 备用免费设备（备胎）出哪些端口。两台设备存在的意义是「证明这把密钥
+// 是活的、并且给出几条能走的隧道」，不需要全量回退面：443 是通用口，
+// 8095 是实测最容易被运营商 QoS 漏过的冷门口。
+// 为什么不给全量：这些节点会进「♻️ 自动选择 / 🎬 流媒体自动」的测速池，
+// 手机上每多一个成员就多一次并发 QUIC 握手 —— 之前 127 次并发
+// 直接把手机打崩，池子必须压住。
+const EXTRA_PORTS = [443, 8095];
 const TEAM_V4 = ["162.159.197.1", "162.159.197.2"];
-const TEAM_PORTS = [443, 8443];
+// 团队边缘端口。官方防火墙文档写得很明确：MASQUE 的 ingress 是
+// 162.159.197.0/24，默认端口 UDP 443，回退端口 500 / 1701 / 4500 /
+// 4443 / 8443 / 8095。原来这里只放 443 和 8443 两个端口，一共 4 个节点，
+// 只要其中一个端口被链路掐掉就塌掉一半 —— 用户反馈「Zero Trust 只有两个
+// 能用」正是端口给少了。七个端口全放上，14 个节点，被掐一个还有别的。
+const TEAM_PORTS = [443, 500, 1701, 4500, 4443, 8443, 8095];
 const ZT_SNI = "zt-masque.cloudflareclient.com";
 
 
+// 免费（消费版）边缘的 SNI。mihomo 在 masque 出站里不写 sni 时的默认值
+// 就是它（transport/masque/masque.go 的 ConnectSNI 常量），这里显式写出来
+// 只为了一件事：「官方域名」那个节点的 SNI 早期被误设成了团队版的
+// zt-masque.cloudflareclient.com。消费版密钥配团队版 SNI，边缘会直接
+// 拒绝 —— 那个节点是恒死的。
+//
+// 两族 SNI 分工：消费版密钥 -> consumer-masque，团队版密钥 -> zt-masque。
+// 混用一定连不上，因为 CF 边缘按 SNI 把连接分给不同的 MASQUE 服务。
+const CONSUMER_SNI = "consumer-masque.cloudflareclient.com";
 // CF 没有 A 记录指向 MASQUE 段，官方域名只能用在 SNI 上
-const OFFICIAL_SNI = "zt-masque.cloudflareclient.com";
 const SNI_NODE = ["162.159.198.1", 443];
 
 const RS = "https://raw.githubusercontent.com";
@@ -93,12 +113,19 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
  *
  * 以前的写法是无条件先把 198/199 那 57 个生成出来，再在 ZT 设备上追加
  * 团队边缘 —— 结果 ZT 一上位，那 57 个节点全部变成永远超时的死节点，
- * 客户端里表现就是「只有 ZT 能用、别的全连不上」。 */
-function buildEntries(dev) {
+ * 客户端里表现就是「只有 ZT 能用、别的全连不上」。
+ *
+ * slot 是**第几台免费设备**（1 起）：
+ *   slot 1 出全集（4 个 IPv4 + 4 个 IPv6 x 7 端口 = 57 个），是主力；
+ *   slot>=2 只出精选端口 x IPv4（16 个），节点名带 W2-/W3- 前缀。
+ * 备胎不需要那么宽的回退面，但要能被「♻️ 自动选择」测到 —— 主力那台
+ * 被 CF 清掉时，备胎是同一族里唯一还活着的节点。 */
+function buildEntries(dev, { slot = 1 } = {}) {
   const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = dev;
   // v4Entries 单独留一份：做 dialer-proxy 目标时只能用 IPv4，
   // 否则纯 IPv4 的机器上会直接 "network is unreachable"。
   const entries = [], v4Entries = [], proxies = [];
+  const tag = slot > 1 ? `W${slot}-` : "";
 
   // 团队边缘。节点名带 "ZT-" 前缀，客户端里一眼能分清是哪一族。
   if (zeroTrust) {
@@ -116,18 +143,24 @@ function buildEntries(dev) {
 
   // 免费边缘。57 个接入点是真机握手实测筛过的，别往回加
   // 162.159.194/196/197/204 和 v6 的 102/105 段 —— 它们回 QUIC 包但 login 失败。
-  for (const ip of [...V4, ...V6]) {
-    for (const port of PORTS) {
-      const n = entryName(ip, port);
+  const ips = slot > 1 ? V4 : [...V4, ...V6];
+  const ports = slot > 1 ? EXTRA_PORTS : PORTS;
+  for (const ip of ips) {
+    for (const port of ports) {
+      const n = tag + entryName(ip, port);
       entries.push(n);
       if (!ip.includes(":")) v4Entries.push(n);
       proxies.push(masqueNode(n, ip, port, priv, pub, v4, v6));
     }
   }
-  entries.push("官方域名");
-  v4Entries.push("官方域名");   // 官方域名节点本身连的是 IPv4
-  proxies.push(masqueNode("官方域名", SNI_NODE[0], SNI_NODE[1],
-                          priv, pub, v4, v6, OFFICIAL_SNI));
+  // 官方域名只给主力那份出。它是「用户能一眼看懂」的兜底节点，
+  // 备胎不需要。SNI 必须是消费版的（以前误用了团队版的，恒死）。
+  if (slot === 1) {
+    entries.push("官方域名");
+    v4Entries.push("官方域名");   // 官方域名节点本身连的是 IPv4
+    proxies.push(masqueNode("官方域名", SNI_NODE[0], SNI_NODE[1],
+                            priv, pub, v4, v6, CONSUMER_SNI));
+  }
   return { entries, proxies, v4Entries, teamEntries: [], teamProxies: [] };
 }
 
@@ -513,36 +546,56 @@ ${p(picks)}
  *
  * 兼容老调用：只传一份 ZT 设备当 warp 时，自动归到 ZT 那一路。
  */
-export function buildConfig(warp, opera, proton, wind, ztDevice = null) {
+/** 备用免费设备的上限。每台只出精选端口池（16 个节点），
+ * 3 台就是 48 个 —— 再多会把订阅撑得很难看，收益却很小。 */
+export const MAX_EXTRA_DEVICES = 3;
+
+export function buildConfig(warp, opera, proton, wind, ztDevice = null, extraWarps = []) {
   let freeDev = warp, ztDev = ztDevice;
   if (warp && warp.zeroTrust) { ztDev = warp; freeDev = null; }
 
-  const free = freeDev ? buildEntries(freeDev) : null;
+  const free = freeDev ? buildEntries(freeDev, { slot: 1 }) : null;
   const zteam = ztDev ? buildEntries(ztDev) : null;
+
+  // 备用免费设备（备胎）。每台是**另一个免费账号、另一把密钥** ——
+  // 主力那台被 CF 清掉 / 密钥失效时，这一族还有活节点在，不至于
+  // 「warp 的节点全死、只剩 ZT 能用」。只出精选端口池，免得把订阅撑爆。
+  // 带 zeroTrust 标记的走错了数组，直接忽略（那是 ZT，不是备胎）。
+  const extras = (extraWarps || [])
+    .filter((d) => d && d.privateKey && d.ipv4 && !d.zeroTrust)
+    .slice(0, MAX_EXTRA_DEVICES)
+    .map((d, i) => buildEntries(d, { slot: i + 2 }));
 
   const freeEntries = free ? free.entries : [];
   const freeV4 = free ? free.v4Entries : [];
+  const extraEntries = extras.flatMap((e) => e.entries);
+  const extraV4 = extraEntries;     // 备胎只出 IPv4，天然就是 v4 池
   const teamEntries = zteam ? zteam.teamEntries : [];
   const zt = teamEntries.length > 0;
 
-  // 两族接入点各用各的密钥，一起进 proxies 池，谁也别顶替谁
+  // 三族接入点各用各的密钥，一起进 proxies 池，谁也别顶替谁
   const proxies = [];
   if (free) proxies.push(...free.proxies);
+  for (const e of extras) proxies.push(...e.proxies);
   if (zteam) proxies.push(...zteam.proxies);
 
   // 全部接入点（含 IPv6）：Opera 的笛卡尔积要的是回退面最广
-  const frontAll = [...freeEntries, ...teamEntries];
+  const frontAll = [...freeEntries, ...extraEntries, ...teamEntries];
   // 只有 IPv4 的接入点：WireGuard 的 UDP 和 load-balance 都必须走这个
-  const frontV4 = [...freeV4, ...teamEntries];
+  const frontV4 = [...freeV4, ...extraEntries, ...teamEntries];
+  // 免费那一族（主力 + 备胎）。它单独留一份，是因为「WARP直连 / 聚合WARP」
+  // 要按**族**暴露给用户：切到这一组就能看出免费族整体活不活。
+  const warpAll = [...freeEntries, ...extraEntries];
+  const warpV4 = [...freeV4, ...extraV4];
   if (!frontAll.length) {
     throw new Error("没有可用的 MASQUE 接入点：consumer WARP 和 Zero Trust 设备都缺失");
   }
 
-  // 落地族的首跳（dialer-proxy）池。ZT 那 4 个比免费边缘稳，但不该让全部
+  // 落地族的首跳（dialer-proxy）池。ZT 那 14 个比免费边缘稳，但不该让全部
   // 落地都压在同一族 —— 交错开，任何一族整体挂掉时另一半落地照样能用。
   // 只收 IPv4：WireGuard/HTTPS 的 UDP 经 IPv6 接入点发出去，在纯 IPv4
   // 的机器上是 network is unreachable。
-  const dialerPool = zt ? interleave(teamEntries, freeV4) : freeV4;
+  const dialerPool = zt ? interleave(teamEntries, warpV4) : warpV4;
 
   // 笛卡尔积：任一接入点或任一落地失效，其他组合仍可用。
   // Opera 用 frontAll（免费 + 团队两族全集），要的就是回退组合尽量多。
@@ -639,16 +692,16 @@ ${q(names)}`).join("\n\n");
   if (windNames.length) landingPool.push("Windscribe线路");
   landingPool.push(...locNames);
   if (zt) landingPool.push("ZT团队边缘");
-  if (freeEntries.length) landingPool.push("WARP直连");
+  if (warpAll.length) landingPool.push("WARP直连");
 
   // 一键开关。三族节点都在这一份订阅里，用户要能按族隔离排查：
   // 「是不是只有某一族能用」这个问题，切开一看组内延迟就清楚了。
   const picks = [...locNames];
   if (zt) picks.push("ZT团队边缘");
-  if (freeEntries.length) picks.push("WARP直连");
+  if (warpAll.length) picks.push("WARP直连");
   picks.push("⚡ 聚合");
   if (zt) picks.push("⚡ 聚合ZT");
-  if (freeV4.length) picks.push("⚡ 聚合WARP");
+  if (warpV4.length) picks.push("⚡ 聚合WARP");
   if (protonNames.length) picks.push("Proton线路", ...protonCCNames);
   if (windNames.length) picks.push("Windscribe线路", ...windLocNames);
 
@@ -661,7 +714,7 @@ ${q(names)}`).join("\n\n");
   // 下面那两个单族子池（⚡ 聚合WARP / ⚡ 聚合ZT）。
   const aggPool = frontV4;
   const ztAggPool = teamEntries;
-  const freeAggPool = freeV4;
+  const freeAggPool = warpV4;
 
   // 精选测速池：只留 PICK_PORTS 里的代表性端口，给需要全员测速的
   // url-test 组用（♻️ 自动选择 / 🎬 流媒体自动）。手机上的测速量
@@ -671,7 +724,18 @@ ${q(names)}`).join("\n\n");
     const m = /-(\d+)$/.exec(n);
     return !m || PICK_PORTS.includes(Number(m[1]));
   };
-  const pickPool = [...freeV4.filter(pickNode), ...teamEntries.filter(pickNode)];
+  // 精选池要**横跨所有免费设备（主力 + 备胎）和 ZT 族**。
+  // 这是「自动优选」的核心：任何一台设备整体失效，池子里还有别的
+  // 设备的节点能被测到 —— 只测主力的话，主力一死，自动选择里
+  // 全是超时，看起来就是「节点全死了」。
+  //
+  // 备胎只取前 2 台进池。池子每多一个成员，多一次并发 QUIC 握手，
+  // 而「♻️ 自动选择」和「🎬 流媒体自动」各自都要跑一遍 —— 手机上的
+  // 测速预算是有限的。3 台备胎的节点仍然都在 WARP直连 / 聚合WARP 里，
+  // 手选得到，只是不参与自动测速。
+  const extraPick = extras.slice(0, 2).flatMap((e) => e.entries);
+  const pickPool = [...freeV4.filter(pickNode), ...teamEntries.filter(pickNode),
+                    ...extraPick];
 
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}线路
     type: url-test
@@ -683,7 +747,8 @@ ${q(names)}`).join("\n\n");
 ${q(tags)}`).join("\n\n");
 
   // ZT 团队边缘直连组。只有 Zero Trust 设备才出现：197.x 这批比 198/199
-  // 更稳，是免费号连不上的。只有 4 个节点，全量测代价可以忽略，
+  // 更稳，是免费号连不上的。2 个 IP x 7 个端口 = 14 个节点，
+  // 全量测代价可以忽略（一个端口被链路掐掉还有另外六个），
   // 所以关掉 lazy、间隔压到 120s —— 用户抱怨「ZT 慢」基本都出在选点不准。
   const ztGroupDef = zt ? `
   - name: ZT团队边缘
@@ -711,7 +776,7 @@ ${q(teamEntries)}
     proxies:
 ${q(ztAggPool)}
 ` : "";
-  const freeAggDef = freeV4.length ? `
+  const freeAggDef = warpV4.length ? `
   - name: ⚡ 聚合WARP
     type: load-balance
     strategy: consistent-hashing
@@ -722,14 +787,17 @@ ${q(ztAggPool)}
 ${q(freeAggPool)}
 ` : "";
 
-  // 免费边缘直连组。没有 consumer 设备时整组不出现 —— 组可以少，
-  // 但绝不能引用不存在的组（内核加载会直接失败）。
+  // 免费边缘直连组（主力 + 备胎）。没有 consumer 设备时整组不出现 ——
+  // 组可以少，但绝不能引用不存在的组（内核加载会直接失败）。
   //
   // 这里是唯一保留「全量 57 个接入点（含 IPv6）」的组，所以 lazy 必须
   // 是 true：关掉 lazy 等于让手机一开机就并发做 57 次 MASQUE 握手，
   // 移动网络下大多数会撞上 3 秒超时，客户端里一片红。
   // 需要它时（切到这一组）内核才开测，测完即为准。
-  const warpGroupDef = freeEntries.length ? `
+  //
+  // 备胎（W2-/W3- 前缀）也放在这一组：主力那台被 CF 清掉时，用户切进来
+  // 能看到「主力全红、备胎是绿的」，一眼就知道是哪台设备的问题。
+  const warpGroupDef = warpAll.length ? `
   - name: WARP直连
     type: url-test
     url: http://www.gstatic.com/generate_204
@@ -739,7 +807,7 @@ ${q(freeAggPool)}
     max-failed-times: 2
     lazy: true
     proxies:
-${q(freeEntries)}
+${q(warpAll)}
 ` : "";
 
   // 流媒体组的候选出口，紧跟默认出口之后列出。
@@ -755,7 +823,7 @@ ${q(freeEntries)}
   const streamExtra = [
     "      - ⚡ 聚合",
     zt ? "      - ⚡ 聚合ZT" : "",
-    freeV4.length ? "      - ⚡ 聚合WARP" : "",
+    warpV4.length ? "      - ⚡ 聚合WARP" : "",
     protonNames.length ? "      - Proton线路" : "",
     windNames.length ? "      - Windscribe线路" : "",
     "      - 🌐 落地出口",
@@ -777,10 +845,15 @@ ${zt ? `#   ZT团队边缘         本机 -> MASQUE(团队边缘 197.x) -> 目�
 #
 # 节点名 "欧洲1@198.1-443" = 欧洲第 1 个落地，经 162.159.198.1:443 接入。
 # ZT- 开头的是 Zero Trust 团队边缘节点（162.159.197.x）。
+# W2- / W3- 开头的是**备用免费设备**的接入点（另一把密钥、另一个账号，
+# 只出 443 / 8095 两个端口 —— 它们是主力设备的备胎，不是主力）。
 #
-# 接入点共 ${frontAll.length} 个（免费边缘 ${freeEntries.length} + ZT 团队边缘 ${teamEntries.length}）
+# 接入点共 ${frontAll.length} 个（免费边缘 ${freeEntries.length}${extraEntries.length ? ` + 备用免费 ${extraEntries.length}` : ""} + ZT 团队边缘 ${teamEntries.length}）
 # x 落地 ${opera.landings.length} 个 = 组合 ${combos} 个${protonNames.length ? `，外加 ${protonNames.length} 个 Proton 落地` : ""}${windNames.length ? ` 和 ${windNames.length} 个 Windscribe 落地` : ""}。
 # 任一环失效都有替代路径；某个族整体不可用时，另外两族照常工作。
+# 节点数字对不对是判断「有没有导入到旧配置」最快的办法：
+#   本份应该有 免费边缘 ${freeEntries.length} 个 / ZT 团队边缘 ${teamEntries.length} 个。
+#   客户端里要是只看到 4 个 ZT 节点，说明导入的是旧配置，重新导入一次即可。
 #
 # 需要 mihomo Alpha 分支：稳定版没有 masque outbound，也不认 dialer-proxy。
 # private-key 等同 WARP 账号凭据，别外传。
@@ -932,5 +1005,8 @@ ${rules}
   return { yaml, entries: frontAll.length, landings: opera.landings.length,
            combos, proton: protonNames.length, wind: windNames.length,
            zeroTrust: zt, teamEdges: teamEntries.length,
-           freeEdges: freeEntries.length };
+           freeEdges: freeEntries.length,
+           // 备用免费设备：台数 + 它们的节点数。UI 要靠这两个数跟用户说清楚
+           // 「免费族有几台设备在扛」，也是排查「一族全死」时的第一手信息。
+           extraDevices: extras.length, extraEdges: extraEntries.length };
 }
