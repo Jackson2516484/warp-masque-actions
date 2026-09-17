@@ -9,16 +9,26 @@
   换到 4G 热点就变成 199.x:8443 最快 —— 运营商对不同 IP/端口段的 QoS 不一样。
   所以「依据设备不同网络环境走最快的线路」这件事，必须实测一次。
 
-它做两件事：
+它做三件事：
   1) 延迟轮：并发调 mihomo API 给所有 masque 节点测 RTT，排序取前 N
   2) 带宽轮：逐个把 🚀 节点选择 切到候选，真实下载一份测速文件，算 MB/s
-  最后把最快的那个设成当前选择。
+  3) 把最快的那个设成当前选择
+另外它还会读一遍配置里的拥塞控制档位，没下发 BBR 就直接点出来 ——
+因为档位不对的话，换哪条线路都跑不快。
 
 用法:
     python pick_fastest.py --sub warp-masque.tuned.yaml
     python pick_fastest.py --sub warp-masque.tuned.yaml --top 5 --seconds 6
     python pick_fastest.py --sub warp-masque.tuned.yaml --dry-run      # 只看结果不切
     python pick_fastest.py --sub warp-masque.tuned.yaml --watch        # 换网络自动重测
+    python pick_fastest.py --sub warp-masque.tuned.yaml --watch --every 30 --min-mbps 5
+
+「一直用上最快的线路」就靠后一条：
+  --watch      换 WiFi / 插网线 / 切热点 就重测（按出口 IP + 默认网关做指纹）
+  --every 30   除此之外每 30 分钟无条件重测一次 —— 同一条网络上，
+               晚高峰的可用带宽能掉到凌晨的三分之一，换网络是等不到这种变化的
+  --min-mbps 5 最快的那条都跑不到 5 MB/s 就直接点出来：那基本不是节点选错了，
+               而是免费版被压在共享出口上，该去绑 WARP+ 授权码了
 
 前提：mihomo / Clash Verge 正在运行，TUN 或系统代理已开。
 只有标准库，不需要 pip 装东西。
@@ -93,6 +103,25 @@ def load_cfg(src: str):
     if not isinstance(cfg, dict):
         raise SystemExit("配置解析失败")
     return cfg
+
+
+def cc_of(cfg: dict) -> str:
+    """读出配置里实际下发的拥塞控制档位，没下发返回空串。
+
+    格式和 Worker 那边生成的一致（见 worker/src/config.js 的 CC_PRESETS）；
+    手写的配置只写其中一部分也算数。"""
+    for p in cfg.get("proxies") or []:
+        if isinstance(p, dict) and p.get("type") == "masque":
+            cc = p.get("congestion-controller")
+            if not cc:
+                return ""
+            bits = [str(cc)]
+            if p.get("cwnd"):
+                bits.append(f"cwnd {p['cwnd']}")
+            if p.get("bbr-profile"):
+                bits.append(str(p["bbr-profile"]))
+            return " · ".join(bits)
+    return ""
 
 
 def pick_group(cfg: dict, want: str | None) -> str:
@@ -192,6 +221,15 @@ def probe(ctrl: Controller, nodes, args):
     return results, alive
 
 
+def hints(best, args):
+    """跑不快的时候，分清是「选错节点」还是「这条链路本身被压住了」。"""
+    if args.min_mbps and best[2] < args.min_mbps:
+        print(f"\n  ⚠ 最快的一条也只有 {best[2]:.2f} MB/s（低于 --min-mbps {args.min_mbps:g}）。"
+              "\n    这通常不是节点选错了 —— 免费版走的是 Cloudflare 共享的普通出口，"
+              "\n    被出口拥塞或链路 QoS 压住很常见。去管理页绑一个 WARP+ 授权码"
+              "\n    （流量改走 Argo 智能选路）通常明显更快更稳，绑完重新导入一次订阅。")
+
+
 def report(results, alive, best):
     print("\n" + "=" * 58)
     print(f"  最快线路：{best[0]}   延迟 {best[1]}ms   吞吐 {best[2]:.2f} MB/s")
@@ -211,6 +249,7 @@ def run_once(ctrl: Controller, nodes, args):
     if not args.dry_run:
         ctrl.select(args.group, best[0])
     report(results, alive, best)
+    hints(best, args)
     return best
 
 
@@ -231,6 +270,12 @@ def main() -> int:
                     help="带宽测试用的下载地址（记得在规则里保证它走代理）")
     ap.add_argument("--dry-run", action="store_true", help="只测不切")
     ap.add_argument("--watch", action="store_true", help="网络环境变了自动重测")
+    ap.add_argument("--every", type=float, default=0,
+                    help="watch 模式下每隔 N 分钟无条件重测一次（默认 0 = 只在换网络时测）。"
+                         "同一条网络上高峰期带宽也会掉，建议配合 --watch 用 30")
+    ap.add_argument("--min-mbps", type=float, default=0,
+                    help="最快的一条低于这个 MB/s 就提示「多半是免费版被限速，该绑 WARP+ 了」"
+                         "（默认 0 = 不提示）")
     args = ap.parse_args()
 
     cfg = load_cfg(args.sub)
@@ -252,23 +297,52 @@ def main() -> int:
         raise SystemExit(f"连不上 mihomo 控制口 {ctrl_raw}：{e}\n"
                          f"确认客户端在跑，且 external-controller 没被防火墙挡住")
 
+    # 线路再好，拥塞控制不对也跑不快：内核默认的 Cubic 一丢包就砍窗口，
+    # 手机上（尤其跨境 + 晚高峰）单流速度会被压死。这儿直接点出来，
+    # 免得用户对着「每条线路都只有 3 MB/s」挨个换节点。
+    cc = cc_of(cfg)
+    if cc:
+        print(f"拥塞控制 {cc}")
+    else:
+        print("拥塞控制 未下发 —— 用的是内核默认 Cubic，丢包就砍窗口，"
+              "换哪条线路都快不起来。\n"
+              "          去管理页「拥塞控制」切到「极速」或「标准」，再重新导入一次订阅。")
+
     if not args.watch:
         run_once(ctrl, nodes, args)
         return 0
 
     fp = net_fingerprint()
-    print(f"\n监听网络变化中（当前 {fp[0]} / 网关 {fp[1]}），Ctrl-C 退出")
-    run_once(ctrl, nodes, args)
+    every = (args.every or 0) * 60
+    print(f"\n监听中（当前 {fp[0]} / 网关 {fp[1]}"
+          + (f"，另外每 {args.every:g} 分钟无条件重测一次" if every else "")
+          + "），Ctrl-C 退出")
+    peak = run_once(ctrl, nodes, args)[2]
+    last = time.monotonic()
     while True:
-        time.sleep(15)
+        time.sleep(5)
         cur = net_fingerprint()
         if cur != fp:
-            fp = cur
-            print(f"\n网络变了 -> {cur[0]} / 网关 {cur[1]}，重新实测 …\n")
-            try:
-                run_once(ctrl, nodes, args)
-            except Exception as e:
-                print(f"重测失败：{e}")
+            why = f"网络变了 -> {cur[0]} / 网关 {cur[1]}"
+        elif every and time.monotonic() - last >= every:
+            why = f"定期重测（每 {args.every:g} 分钟）"
+        else:
+            continue
+        fp, last = cur, time.monotonic()
+        print(f"\n{why}，重新实测 …\n")
+        try:
+            got = run_once(ctrl, nodes, args)[2]
+        except Exception as e:
+            print(f"重测失败：{e}")
+            continue
+        if got > peak:
+            print(f"\n  ↑ 新纪录 {got:.2f} MB/s（旧的最好 {peak:.2f}）")
+            peak = got
+        elif peak and got < peak * 0.6:
+            # 分清「换条线路就好」和「整条链路都被压住了」——后者折腾节点没用
+            print(f"\n  ⚠ 这轮最好才 {got:.2f} MB/s，历史最好 {peak:.2f}。"
+                  "\n    所有候选一起掉，多半是上游 / 高峰期在压，不是某个节点坏了 ——"
+                  "\n    可以先别折腾节点，等一会儿或换个出口族（ZT 团队边缘）再看。")
 
 
 if __name__ == "__main__":

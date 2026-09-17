@@ -10,9 +10,10 @@
 //      前者出免费边缘 198/199 那族，后者出团队边缘 197.x 那族。
 //      两套密钥在 CF 那边分开认证，谁也顶替不了谁，所以两份都要留着。
 //   3. 首次访问引导设密码，之后订阅路径、改密码都在界面里做
-import { registerWarp, verifyDevice, reenrollMasque } from "./warp.js";
+import { registerWarp, verifyDevice, reenrollMasque,
+         getAccount, bindLicense, normalizeLicense } from "./warp.js";
 import { fetchOpera } from "./opera.js";
-import { buildConfig, MAX_EXTRA_DEVICES } from "./config.js";
+import { buildConfig, MAX_EXTRA_DEVICES, CC_PRESETS, DEFAULT_CC } from "./config.js";
 import { parseBlob } from "./proton.js";
 import { fetchWindscribe, fetchSession } from "./windscribe.js";
 import { renderUI, renderLogin, renderSetup, renderNoKV } from "./ui.js";
@@ -25,6 +26,7 @@ const K_WARP = "warp:device";     // WARP 注册信息，长期复用
 const K_WARP_X = "warp:devices:extra";  // 备用免费设备（备胎），数组
 const K_ZT = "zt:device";         // Zero Trust 注册信息（团队边缘用），长期复用
 const K_DIAG = "diag:report";     // 最近一次设备体检的结果
+const K_LIC = "warp:license";     // 最近一次查到的 WARP+ 状态（warp_plus / 额度）
 const K_CFG = "config:yaml";      // 聚合配置（套娃线路 + WARP 直连）
 const K_STATE = "state:meta";     // 状态元数据，给 UI 用
 const K_CRED = "auth:cred";       // 密码哈希 + 盐
@@ -62,7 +64,12 @@ const notFound = () => new Response("Not Found", { status: 404 });
 
 async function getSettings(env) {
   const s = (await env.KV.get(K_SET, "json")) || {};
-  return { subPath: s.subPath || DEFAULT_SUB };
+  return {
+    subPath: s.subPath || DEFAULT_SUB,
+    // 拥塞控制档位。认不出来（手改坏、老版本写过别的值）就退回默认档，
+    // 不抛错 —— 一份订阅里少个可选调优项，好过整个页面打不开。
+    cc: CC_PRESETS[s.cc] ? s.cc : DEFAULT_CC,
+  };
 }
 
 /** 拿 WARP 设备信息，KV 里有就复用，没有才注册。 */
@@ -156,10 +163,12 @@ async function rebuild(env, { forceWarp = false } = {}) {
   }
   // 备用免费设备（备胎）。拿不到就是空数组，不影响主力那台。
   const extras = await getExtraWarps(env);
+  // 拥塞控制档位存在 settings 里，改档位走 /api/cc 然后重建
+  const settings = await getSettings(env);
   const { yaml, entries, landings, combos, proton: pn, wind: wn,
           zeroTrust: ztFlag, teamEdges, freeEdges,
-          extraDevices, extraEdges } =
-    buildConfig(warp, opera, proton, wind, ztDev, extras);
+          extraDevices, extraEdges, cc, ccLabel } =
+    buildConfig(warp, opera, proton, wind, ztDev, extras, { cc: settings.cc });
 
   const now = Date.now();
   const devInfo = (d) => d ? {
@@ -176,7 +185,8 @@ async function rebuild(env, { forceWarp = false } = {}) {
     expiresAt: new Date(now + TTL_MS).toISOString(),
     stats: { entries, landings, combos, proton: pn || 0, wind: wn || 0,
              teamEdges: teamEdges || 0, freeEdges: freeEdges || 0,
-             extraDevices: extraDevices || 0, extraEdges: extraEdges || 0 },
+             extraDevices: extraDevices || 0, extraEdges: extraEdges || 0,
+             cc: cc || DEFAULT_CC, ccLabel: ccLabel || "" },
     protonExpiresAt: proton ? proton.expiresAt : null,
     wind: wind ? { userId: wind.account.userId, servers: wn || 0 } : null,
     windErr,
@@ -188,6 +198,8 @@ async function rebuild(env, { forceWarp = false } = {}) {
     zt: devInfo(ztDev),
     // 最近一次设备体检结果。没体检过就是 null。
     diag: await env.KV.get(K_DIAG, "json"),
+    // 最近一次查到的 WARP+ 状态（绑定时、体检时都会刷新）
+    license: await env.KV.get(K_LIC, "json"),
   };
 
   await env.KV.put(K_CFG, yaml);
@@ -552,7 +564,14 @@ export default {
       const items = [];
       for (const r of roles) {
         const v = await verifyDevice(r.dev);
+        // 顺手把账号状态也读出来 —— 「我到底在不在 WARP+ 上」是用户
+        // 问得最多的一句，跟体检共用一次点击。
+        const acc = v.ok === true ? await getAccount(r.dev) : { ok: null };
         items.push({
+          // null = 查不了（没有 token 的流水线 ZT 设备）
+          warpPlus: acc.ok === true ? acc.warpPlus : null,
+          premiumData: acc.ok === true ? acc.premiumData : 0,
+          quota: acc.ok === true ? acc.quota : 0,
           role: r.role,
           deviceId: r.dev.deviceId || "",
           ipv4: r.dev.ipv4 || "",
@@ -565,6 +584,17 @@ export default {
 
       const report = { at: new Date().toISOString(), items };
       await env.KV.put(K_DIAG, JSON.stringify(report));
+
+      // 主力那台的账号状态单独存一份：管理页的 WARP+ 区块直接读它，
+      // 不用每次开页面都去打一次 CF。
+      const main = items.find((x) => x.role === "免费 WARP（主力）" && x.warpPlus !== null);
+      if (main) {
+        await env.KV.put(K_LIC, JSON.stringify({
+          at: report.at, warpPlus: main.warpPlus,
+          premiumData: main.premiumData, quota: main.quota,
+          license: main.license || "", deviceId: main.deviceId || "",
+        }));
+      }
       // 顺手并进 state：体检本身不重建配置（重建要重新拉 Opera 凭据，
       // 代价大且没必要），但管理页读的是 K_STATE，不写进去刷新后看不到。
       // state 可能还不存在（KV 全新、还没生成过订阅）—— 那就先建个壳，
@@ -585,6 +615,92 @@ export default {
             "如果客户端里还是有节点连不上，那就是链路/端口层面的问题，" +
             "不是设备凭据：换个端口（4443 / 8443 / 8095）或用 ZT 族试。",
       });
+    }
+
+    // ---- 换拥塞控制档位 ----
+    // 这是「网速」最直接的一个开关，所以做成一个按钮而不是让用户改 YAML。
+    // 三个档：
+    //   极速  bbr + cwnd 128 + aggressive —— 单流吞吐最大，丢包也硬冲
+    //   标准  bbr + cwnd 64  + standard   —— 默认，抗丢包且不霸占链路
+    //   回退  不下发，用内核默认 Cubic     —— 极拥堵链路上最保守
+    // 注意它是**生成期**开关：改完必须重建，客户端要重新导入订阅才生效。
+    if (path === "/api/cc" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const cc = String(body.cc || "");
+      if (!CC_PRESETS[cc]) {
+        return json({ ok: false,
+          error: `档位只能是 ${Object.keys(CC_PRESETS).join(" / ")}` }, 400);
+      }
+      const st0 = await getSettings(env);
+      await env.KV.put(K_SET, JSON.stringify({ ...st0, cc }));
+      let st = null;
+      try { st = await rebuild(env); }
+      catch (e) { return json({ ok: false, error: `已保存档位，但重建失败：${e.message}` }, 500); }
+      const p = CC_PRESETS[cc];
+      return json({ ok: true,
+        msg: `拥塞控制已切到「${p.label}」档` +
+          (p.cc ? `（${p.cc}${p.cwnd ? ` · cwnd ${p.cwnd}` : ""}${p.profile ? ` · ${p.profile}` : ""}）`
+                : "（不下发，内核默认 Cubic）") +
+          `。客户端要重新导入一次订阅才生效（免费边缘 ${st.stats.freeEdges || 0} 个节点已重写）` });
+    }
+
+    // ---- WARP+ 授权码 ----
+    // 免费版走的是共享的普通出口，容易被出口拥塞和链路 QoS 拖住；
+    // 绑了授权码之后账号变成 WARP+，流量走 Cloudflare 的 Argo 智能选路，
+    // 这是单流速度上最大的一根杠杆。授权码在 1.1.1.1 App 的
+    // Account > Key 里（只认官方买的，推荐得来的无效）。
+    //
+    // fresh=true 走「换新设备再绑定」：CF 侧有个老 bug，已经连过 WARP 的
+    // 账号绑了授权码也可能不生效（warp_plus 仍是 false）。正解是注册一台
+    // 干净设备、在它连任何一次之前就把授权码绑上去。
+    if (path === "/api/warp/license" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const nz = normalizeLicense(body.key);
+      if (!nz.ok) return json({ ok: false, error: nz.error }, 400);
+      const fresh = !!body.fresh;
+
+      let warp = await env.KV.get(K_WARP, "json");
+      const notes = [];
+      if (fresh || !warp || !warp.token) {
+        if (!fresh && (!warp || !warp.token)) {
+          notes.push("原设备没有 device token，先注册了一台新的");
+        }
+        try {
+          warp = await registerWarp(fresh ? "cf-worker-plus" : "cf-worker");
+          if (fresh) notes.push("已新注册一台干净设备");
+        } catch (e) {
+          return json({ ok: false, error: `注册设备失败：${e.message}` }, 500);
+        }
+      }
+
+      let acc;
+      try {
+        acc = await bindLicense(warp, nz.key);
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 500);
+      }
+
+      // 绑定成功才落盘：失败时保留原来那台设备，别把它弄丢了
+      await env.KV.put(K_WARP, JSON.stringify(warp));
+      const rec = { at: new Date().toISOString(), ...acc,
+                    license: nz.key.slice(0, 4) + "…", deviceId: warp.deviceId || "" };
+      await env.KV.put(K_LIC, JSON.stringify(rec));
+
+      let st = null;
+      try { st = await rebuild(env); } catch { /* 重建失败不影响绑定本身 */ }
+
+      const head = notes.length ? notes.join("；") + "。" : "";
+      if (acc.warpPlus) {
+        return json({ ok: true, warpPlus: true,
+          msg: `${head}授权码已生效 —— 账号已是 WARP+，流量走 Argo 智能选路，` +
+            `速度通常明显更高更稳。配置已重建` +
+            `${st ? `（免费边缘 ${st.stats.freeEdges || 0} 个）` : ""}，` +
+            "重新导入一次订阅即可" });
+      }
+      return json({ ok: true, warpPlus: false,
+        msg: `${head}授权码 CF 收下了，但 warp_plus 仍是 false。` +
+          "这是 CF 侧已知问题：已经连过 WARP 的账号绑了也可能不生效。" +
+          "点「换新设备再绑定」—— 新设备在连任何一次之前绑，就生效。" });
     }
 
     // ---- 一键修复：把被 CF 删掉的免费设备换新 ----

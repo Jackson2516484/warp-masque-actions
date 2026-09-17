@@ -708,5 +708,179 @@ t("新密码能登上",
   globalThis.fetch = realFetch;
 }
 
+// ---- 拥塞控制档位 / WARP+ 授权码 ----
+//
+// 两件事都是「怎么让速度更高」：档位决定同一条链路上跑多快（换算法），
+// 授权码决定你走的是不是 CF 的优质骨干（换路由）。两条都在这里守住：
+// 档位要真写进 YAML、要能回退、脏输入不能把订阅搞崩；授权码要走对
+// CF 的接口、要能识别「绑了但不生效」这种半成功状态。
+{
+  reset();
+  // 直接用 /api/setup 下发的会话 cookie，不再走一次 /login ——
+  // 登录接口有按 IP 的限流，测试里能少打一次就少打一次。
+  const ah = { cookie: (await worker.fetch(
+    post("/api/setup", { password: PW, confirm: PW }), env))
+    .headers.get("set-cookie").split(";")[0] };
+
+  const devPrimary = {
+    deviceId: "dev-primary", token: "tok-p",
+    privateKey: "PK-PRIMARY", peerPublicKey: "PUB-P",
+    ipv4: "172.16.0.2", ipv6: "2606:4700:110::2",
+    registeredAt: new Date().toISOString(), accountType: "free",
+  };
+  kv.set("warp:device", JSON.stringify(devPrimary));
+
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  let licWarpPlus = true;   // PUT /account 之后 CF 说账号是什么状态
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url), m = init.method || "GET";
+    if (u.includes("api2.sec-tunnel.com")) {
+      const path = u.split("/").pop();
+      const body = { status: { code: 0 } };
+      if (path === "register_device") body.data = { device_id: "dev-op" };
+      if (path === "device_generate_password") body.data = { device_password: "pwd" };
+      if (path === "discover") body.data = { ips: [{ ip: "1.2.3.4", port: [443] }] };
+      return new Response(JSON.stringify(body),
+        { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (u.includes("api.cloudflareclient.com")) {
+      // 绑定授权码
+      if (m === "PUT" && u.includes("/account")) {
+        const b = JSON.parse(init.body || "{}");
+        calls.push(`put-license:${b.license}`);
+        return new Response(JSON.stringify({
+          id: "acct-1", license: b.license, warp_plus: licWarpPlus,
+          premium_data: licWarpPlus ? 5000000000 : 0, quota: 0, role: "child",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      // 读账号状态
+      if (m === "GET" && u.includes("/account")) {
+        calls.push("get-account");
+        return new Response(JSON.stringify({
+          license: "AAAA-BBBB-CCCC", warp_plus: true,
+          premium_data: 7 * 1073741824, quota: 0, account_type: "warp_plus",
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (m === "POST" && u.endsWith("/reg")) {
+        calls.push("reg-new");
+        return new Response(JSON.stringify({
+          id: "dev-fresh", token: "tok-fresh", account: { account_type: "free" },
+          config: { interface: { addresses: {
+            v4: "172.16.9.2", v6: "2606:4700:110:9::2" } } },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (m === "PATCH") {
+        calls.push("patch");
+        return new Response(JSON.stringify({
+          config: { peers: [{ public_key: "PEER" }],
+                    interface: { addresses: {
+                      v4: "172.16.9.2", v6: "2606:4700:110:9::2" } } },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      calls.push("verify");
+      return new Response(JSON.stringify({
+        account: { account_type: "free" }, config: { peers: [{ public_key: "PUB-P" }] },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response("no mock", { status: 500 });
+  };
+
+  // ---- 档位 ----
+  t("未登录不能换档位", (await worker.fetch(post("/api/cc", { cc: "extreme" }), env)).status === 404);
+
+  const bad = await worker.fetch(post("/api/cc", { cc: "turbo" }, ah), env);
+  const badj = await bad.json();
+  t("非法档位被拒并列出可用值",
+    bad.status === 400 && /extreme/.test(badj.error) && /cubic/.test(badj.error));
+
+  const ex = await worker.fetch(post("/api/cc", { cc: "extreme" }, ah), env);
+  const exj = await ex.json();
+  t("切极速档成功", ex.status === 200 && exj.ok);
+  t("档位落 KV", JSON.parse(kv.get("settings")).cc === "extreme");
+  const y1 = kv.get("config:yaml");
+  t("重建后的订阅里下发 bbr", /congestion-controller: bbr/.test(y1));
+  t("重建后的订阅里 cwnd = 128", /cwnd: 128/.test(y1));
+  t("重建后的订阅里 profile = aggressive", /bbr-profile: aggressive/.test(y1));
+  t("state 里带上档位（UI 要显示）",
+    JSON.parse(kv.get("state:meta")).stats.cc === "extreme" &&
+    JSON.parse(kv.get("state:meta")).stats.ccLabel === "极速");
+  t("提示里说明要重新导入订阅才生效", /重新导入/.test(exj.msg));
+
+  const cu = await worker.fetch(post("/api/cc", { cc: "cubic" }, ah), env);
+  t("切回退档成功", cu.status === 200);
+  const y2 = kv.get("config:yaml");
+  t("回退档整个订阅里一个 congestion-controller 都没有",
+    !/congestion-controller/.test(y2) && !/bbr-profile/.test(y2));
+
+  const st = JSON.parse(kv.get("state:meta"));
+  t("state 跟着变成 cubic", st.stats.cc === "cubic");
+
+  // ---- 授权码 ----
+  t("未登录不能绑授权码",
+    (await worker.fetch(post("/api/warp/license", { key: "AAAA-BBBB-CCCC" }), env)).status === 404);
+
+  for (const [label, k] of [
+    ["空串", ""],
+    ["乱码", "hello-world"],
+    ["两段式", "AAAA-BBBB"],
+    ["四段式", "AAAA-BBBB-CCCC-DDDD"],
+    ["带非法字符", "AAAA-BBBB-CC!!"],
+  ]) {
+    const r = await worker.fetch(post("/api/warp/license", { key: k }, ah), env);
+    t(`授权码${label}被拒`, r.status === 400);
+  }
+  t("格式错的时候一次 CF 都没打", !calls.some((c) => c.startsWith("put-license")));
+
+  // 官方文档里的占位符带尖括号，用户会连着尖括号一起复制
+  const ok1 = await worker.fetch(
+    post("/api/warp/license", { key: "<AAAA-BBBBBBBBB-CCCCCCCCCC>" }, ah), env);
+  const ok1j = await ok1.json();
+  t("尖括号 / 空白自动剥掉后能绑",
+    ok1.status === 200 && calls.includes("put-license:AAAA-BBBBBBBBB-CCCCCCCCCC"));
+  t("绑定成功时返回 warpPlus 标记并写 KV",
+    ok1j.ok === true && ok1j.warpPlus === true && !!kv.get("warp:license"));
+  t("授权码不回显全文（只留前 4 位）", !JSON.stringify(kv.get("warp:license")).includes("CCCCCCCCCC"));
+  t("提示里点出 WARP+ / Argo", /WARP\+/.test(ok1j.msg) && /Argo/.test(ok1j.msg));
+
+  // ---- 半成功：CF 收下了但账号没变成 WARP+ ----
+  // 这是 CF 侧的老问题：已经连过 WARP 的账号绑了授权码也可能不生效。
+  // 这种情况下必须提示用户改走「换新设备再绑定」，不能报成功。
+  licWarpPlus = false;
+  const half = await worker.fetch(post("/api/warp/license", { key: "DDDD-EEEE-FFFF" }, ah), env);
+  const halfj = await half.json();
+  t("绑了但没生效时明确说 warp_plus 仍是 false",
+    /warp_plus/.test(halfj.msg) && /false/.test(halfj.msg));
+  t("引导用户去点「换新设备再绑定」", /换新设备/.test(halfj.msg));
+  t("半成功不谎报成功状态", halfj.ok === true && halfj.warpPlus === false);
+
+  // ---- 换新设备再绑定 ----
+  licWarpPlus = true;
+  kv.delete("warp:device");
+  kv.set("warp:device", JSON.stringify(devPrimary));
+  const before = calls.filter((c) => c === "reg-new").length;
+  const fresh = await worker.fetch(
+    post("/api/warp/license", { key: "1111-2222-3333", fresh: true }, ah), env);
+  t("换新设备会先注册一台干净设备",
+    calls.filter((c) => c === "reg-new").length === before + 1);
+  t("新设备已落 KV（不再用旧那台）",
+    JSON.parse(kv.get("warp:device")).deviceId === "dev-fresh");
+  t("新设备也跑了一次 MASQUE enroll", calls.includes("patch"));
+  t("换新绑定成功", (await fresh.json()).warpPlus === true);
+
+  // ---- 体检顺带把账号状态读出来 ----
+  kv.set("warp:license", "");
+  const dg = await worker.fetch(post("/api/diag", {}, ah), env);
+  const dgj = await dg.json();
+  const main = dgj.report.items.find((x) => x.role.includes("主力"));
+  t("体检结果里带上 warp_plus", main && main.warpPlus === true);
+  t("体检结果里带上剩余额度（字节）", main && main.premiumData === 7 * 1073741824);
+  t("体检把账号状态写回 KV，管理页不用再打 CF", !!kv.get("warp:license"));
+  t("写回的状态里 warp_plus 正确",
+    JSON.parse(kv.get("warp:license")).warpPlus === true);
+
+  globalThis.fetch = realFetch;
+}
+
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);

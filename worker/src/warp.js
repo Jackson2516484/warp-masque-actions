@@ -161,6 +161,108 @@ export async function verifyDevice(dev) {
   };
 }
 
+
+/** 授权码归一化。CF 要的格式是 XXXXXXXX-XXXXXXXXX-XXXXXXXXXX（三段、短横线）。
+ *
+ * 用户从 1.1.1.1 App 的 Account > Key 里复制，实际粘进来的东西五花八门：
+ * 带尖括号（官方 Linux 文档里那个占位符就带）、带空格、带换行、首尾引号。
+ * 全部剥掉再校验，能救回一大半「明明复制对了却报格式错」。
+ */
+export function normalizeLicense(raw) {
+  const k = String(raw || "").replace(/[\s<>"']/g, "");
+  if (!k) return { ok: false, error: "授权码是空的" };
+  if (!/^[0-9a-zA-Z]{4,16}(-[0-9a-zA-Z]{4,16}){2}$/.test(k)) {
+    return { ok: false,
+      error: `这串不像 WARP+ 授权码（应该是 XXXXXXXX-XXXXXXXXX-XXXXXXXXXX 三段式）：${k.slice(0, 40)}` };
+  }
+  return { ok: true, key: k };
+}
+
+/** 读这台设备的账号状态。
+ *
+ * `GET /reg/{id}/account` 回 { license, warp_plus, premium_data, quota, ... }：
+ *   warp_plus: true      已经吃到 WARP+（走 Argo 智能选路）
+ *   premium_data/quota   剩余可用额度（字节）。0 通常表示不限量
+ * 注意：官方应用里买的授权码是**按账号**的，一台设备 = 一个账号。
+ */
+export async function getAccount(dev) {
+  if (!dev || !dev.deviceId) return { ok: null, error: "没有 deviceId" };
+  if (!dev.token) return { ok: null, error: "这台设备没有 device token，读不了账号状态" };
+  let r;
+  try {
+    r = await fetch(`${API}/reg/${dev.deviceId}/account`, {
+      headers: { ...H, Authorization: `Bearer ${dev.token}` },
+    });
+  } catch (e) {
+    return { ok: null, error: `请求 CF 失败：${e.message}` };
+  }
+  if (!r.ok) {
+    return { ok: null, status: r.status,
+      error: `CF 返回 HTTP ${r.status}：${(await r.text().catch(() => "")).slice(0, 120)}` };
+  }
+  let j = {};
+  try { j = await r.json(); } catch { /* 空响应 */ }
+  return {
+    ok: true,
+    warpPlus: !!j.warp_plus,
+    license: j.license || "",
+    premiumData: Number(j.premium_data || 0),
+    quota: Number(j.quota || 0),
+    accountType: j.account_type || "",
+    role: j.role || "",
+  };
+}
+
+/** 把 WARP+ 授权码绑到这台设备所在的账号上。
+ *
+ * `PUT /reg/{id}/account` + `{"license": "<key>"}`。成功后账号的
+ * account_type 会从 free 变成 warp_plus 一类，流量改走 Cloudflare 的
+ * Argo 智能选路 —— 这是**单流速度**上最大的一根杠杆：免费版走的是
+ * 共享的普通出口，容易被链路 QoS 和出口拥塞拖住；WARP+ 走 CF 的优质骨干。
+ *
+ * 两个必须告诉用户的坑（都在返回值里带上）：
+ *  1. 只有「从官方 1.1.1.1 App 里买的」授权码有效。推荐/活动拿到的
+ *     一律无效，CF 会直接拒。
+ *  2. CF 侧有个老 bug：**已经连过 WARP 的账号**绑了授权码也可能不生效
+ *     （warp_plus 仍是 false）。解法是「新注册一台设备、在它连任何一次
+ *     之前就把授权码绑上」—— 所以调用方拿到 ok:true 但 warpPlus:false 时，
+ *     要提示用户改用「换新设备再绑定」那条路。
+ */
+export async function bindLicense(dev, rawKey) {
+  if (!dev || !dev.deviceId) throw new Error("没有设备可绑定，先注册一台");
+  if (!dev.token) {
+    throw new Error("这台设备没有 device token（多半是流水线推来的 ZT 设备），" +
+                    "绑不了授权码。免费设备才有 token。");
+  }
+  const nz = normalizeLicense(rawKey);
+  if (!nz.ok) throw new Error(nz.error);
+
+  const r = await fetch(`${API}/reg/${dev.deviceId}/account`, {
+    method: "PUT",
+    headers: { ...H, Authorization: `Bearer ${dev.token}` },
+    body: JSON.stringify({ license: nz.key }),
+  });
+  const txt = await r.text();
+  if (!r.ok) {
+    // CF 常见的两种拒绝：授权码已被别的账号占用、授权码无效。
+    // 原文比任何转述都准，直接透出去。
+    const hint = /already|in use|used/i.test(txt)
+      ? "。这个码已经绑在别的账号上了 —— 先在 1.1.1.1 App 里把其他设备解绑再试。"
+      : "";
+    throw new Error(`CF 拒绝了这个授权码（HTTP ${r.status}）：${txt.slice(0, 200)}${hint}`);
+  }
+  let j = {};
+  try { j = JSON.parse(txt); } catch { /* 空响应 */ }
+  return {
+    ok: true,
+    warpPlus: !!j.warp_plus,
+    license: j.license || nz.key,
+    premiumData: Number(j.premium_data || 0),
+    quota: Number(j.quota || 0),
+    accountType: j.account_type || "",
+  };
+}
+
 /** 给已存在的设备**重新装一把 MASQUE 密钥**，返回更新后的设备对象。
  *
  * 用在「设备在 CF 那边还活着，但本地这把密钥认证不过」的情况。成因有两种：

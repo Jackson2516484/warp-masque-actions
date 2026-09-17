@@ -1,5 +1,5 @@
 // 配置结构测试。跑: node test/config.test.mjs
-import { buildConfig } from "../src/config.js";
+import { buildConfig, CC_PRESETS, DEFAULT_CC } from "../src/config.js";
 
 const warp = {
   privateKey: "MGsCAQEEIFAKE", peerPublicKey: "MFkwEwFAKE",
@@ -582,6 +582,149 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
     .matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
   t("第 3 台备胎不进自动测速池",
     manyPick.some((m) => m.startsWith("W3-")) && !manyPick.some((m) => m.startsWith("W4-")));
+}
+
+// ---- 拥塞控制档位 ----
+//
+// 起因：用户问「能不能让我一直用上超高网速的节点」。换节点只是换一条链路，
+// 而链路上能跑多快由**拥塞控制算法**决定。mihomo 的 masque 出站认
+// congestion-controller / cwnd / bbr-profile 三个键
+// （adapter/outbound/masque.go 的 MasqueOption，最终落到
+// transport/tuic/common/congestion.go 的 SetCongestionController）。
+// 不写这三个键 = 走 quic-go 内核默认 Cubic —— Cubic 把丢包直接当拥塞信号，
+// 手机上（尤其跨境 + 晚高峰）一丢包就砍窗口，单流速度上不去。
+// 这里守死两件事：默认档必须真的下发 BBR；cubic 档必须一条都不下发
+// （它是「完全恢复原状」的回退键，多一个键就不算回退了）。
+{
+  const nodes = (y) => [...y.matchAll(/^  - name: (\S+)\n    type: masque$/gm)].map((m) => m[1]);
+  const blocks = (y) => {
+    const out = [];
+    const lines = y.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (/^  - name: \S+$/.test(lines[i]) && lines[i + 1] === "    type: masque") {
+        const b = [];
+        for (let j = i + 1; j < lines.length; j++) {
+          if (/^  - name: /.test(lines[j])) break;
+          b.push(lines[j]);
+        }
+        out.push({ name: lines[i].slice("  - name: ".length), body: b.join("\n") });
+      }
+    }
+    return out;
+  };
+
+  t("DEFAULT_CC 是 standard（默认不能用最激进的那档）", DEFAULT_CC === "standard");
+  t("三个档位齐全", ["extreme", "standard", "cubic"].every((k) => k in CC_PRESETS));
+
+  // ---- 默认档（不传 opts）----
+  {
+    const r = buildConfig(warp, opera);
+    const bs = blocks(r.yaml);
+    t(`默认档下发到全部 ${bs.length} 个接入点`,
+      bs.length === nodes(r.yaml).length && bs.length > 0);
+    t("默认档每条都有 congestion-controller: bbr",
+      bs.every((b) => b.body.includes("congestion-controller: bbr")));
+    t("默认档 cwnd = 64（单位是包，不是字节）",
+      bs.every((b) => b.body.includes("cwnd: 64")));
+    t("默认档 bbr-profile = standard",
+      bs.every((b) => b.body.includes("bbr-profile: standard")));
+    t("返回值带上档位名和标签", r.cc === "standard" && r.ccLabel === "标准");
+    t("头部注释声明了当前档位", /拥塞控制：全部 MASQUE 接入点走「标准」档/.test(r.yaml));
+  }
+
+  // ---- 极速档 ----
+  {
+    const r = buildConfig(warp, opera, null, null, null, [], { cc: "extreme" });
+    const bs = blocks(r.yaml);
+    t("极速档 cwnd = 128", bs.every((b) => b.body.includes("cwnd: 128")));
+    t("极速档 profile = aggressive",
+      bs.every((b) => b.body.includes("bbr-profile: aggressive")));
+    t("极速档返回值正确", r.cc === "extreme" && r.ccLabel === "极速");
+  }
+
+  // ---- 回退档：一条都不许下发 ----
+  {
+    const r = buildConfig(warp, opera, null, null, null, [], { cc: "cubic" });
+    t("回退档一个节点都不带 congestion-controller（= 完全恢复原状）",
+      !r.yaml.includes("congestion-controller"));
+    t("回退档也不带 cwnd / bbr-profile",
+      !r.yaml.includes("cwnd:") && !r.yaml.includes("bbr-profile"));
+    t("回退档头部注释写的是「不下发」", /不下发，用内核默认 Cubic/.test(r.yaml));
+  }
+
+  // ---- 三族都得带上：免费边缘、ZT 团队边缘、备胎 ----
+  {
+    const zt = { ...warp, zeroTrust: true, deviceId: "z" };
+    const r = buildConfig(warp, opera, null, null, zt, [{ ...warp, privateKey: "P2" }],
+                          { cc: "extreme" });
+    const bs = blocks(r.yaml);
+    const free = bs.filter((b) => !b.name.startsWith("ZT-") && !b.name.startsWith("W"));
+    const team = bs.filter((b) => b.name.startsWith("ZT-"));
+    const bak = bs.filter((b) => b.name.startsWith("W2-"));
+    t(`三族都在（免费 ${free.length} / ZT ${team.length} / 备胎 ${bak.length}）`,
+      free.length > 0 && team.length > 0 && bak.length > 0);
+    t("免费边缘带上了档位", free.every((b) => b.body.includes("cwnd: 128")));
+    t("ZT 团队边缘带上了档位", team.every((b) => b.body.includes("cwnd: 128")));
+    t("备胎带上了档位", bak.every((b) => b.body.includes("cwnd: 128")));
+    t("官方域名节点也带上（它以前恒死，现在连 CC 也要一致）",
+      bs.find((b) => b.name === "官方域名").body.includes("bbr-profile: aggressive"));
+  }
+
+  // ---- 脏输入不许把整份配置搞崩 ----
+  {
+    let r = null;
+    try { r = buildConfig(warp, opera, null, null, null, [], { cc: "no-such-cc" }); }
+    catch (e) { t("非法档位不该抛错: " + e.message, false); }
+    t("非法档位静默退回默认档", !!r && r.cc === "standard");
+    let r2 = null;
+    try { r2 = buildConfig(warp, opera, null, null, null, [], { cc: 12345 }); }
+    catch { /* 期望不抛 */ }
+    t("非字符串档位也退回默认档", !!r2 && r2.cc === "standard");
+  }
+
+  // ---- 选点灵敏度：这才是「一直跑在最快节点上」的执行部分 ----
+  const grpDef = (y, name) => {
+    const i = y.indexOf(`  - name: ${name}\n`);
+    return i < 0 ? "" : y.slice(i, y.indexOf("\n  - name:", i + 10));
+  };
+  {
+    // 带上 ZT 才测得到 ZT团队边缘 那一组
+    const zt = { ...warp, zeroTrust: true, deviceId: "zt-x" };
+    const r = buildConfig(warp, opera, null, null, zt, [], { cc: "standard" });
+    const auto = grpDef(r.yaml, "♻️ 自动选择");
+    const stream = grpDef(r.yaml, "🎬 流媒体自动");
+    const zg = grpDef(r.yaml, "ZT团队边缘");
+
+    t("♻️ 自动选择 每 60 秒重测一轮", /interval: 60/.test(auto));
+    t("♻️ 自动选择 换手阈值收到 10ms", /tolerance: 10/.test(auto));
+    t("♻️ 自动选择 2 秒不回就判失败", /timeout: 2000/.test(auto));
+    t("♻️ 自动选择 开机即测（lazy:false）", /lazy: false/.test(auto));
+    // max-failed-times 故意是 2 而不是 1：设成 1 时一次抖动就把好节点标死，
+    // 多节点同时抖动会让整组「看着全死」—— 那正是用户抱怨过的现象
+    t("♻️ 自动选择 max-failed-times 是 2（不是 1）", /max-failed-times: 2/.test(auto));
+
+    t("🎬 流媒体自动 收紧到 90s / 10ms",
+      /interval: 90/.test(stream) && /tolerance: 10/.test(stream));
+    t("ZT团队边缘 收紧到 90s / 15ms",
+      /interval: 90/.test(zg) && /tolerance: 15/.test(zg));
+    t("ZT团队边缘 也开机即测", /lazy: false/.test(zg));
+
+    // 参数越收越紧，但池子不能跟着变大 —— 手机上并发握手次数是硬预算。
+    // 历史上 127 次并发把手机打崩过，所以这里守一个上限。
+    const pick = [...auto.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+    t(`自动选择池 ${pick.length} 个，仍在手机并发预算内（<=41）`,
+      pick.length > 0 && pick.length <= 41);
+    t("自动选择池跨两族（免费边缘 + ZT 团队边缘）",
+      pick.some((n) => n.startsWith("ZT-")) && pick.some((n) => !n.startsWith("ZT-")));
+  }
+  {
+    // 只有免费设备时，池子就是 4 个精选端口 x 4 个 IPv4 + 官方域名 = 17
+    const r = buildConfig(warp, opera, null, null, null, [], { cc: "standard" });
+    const pick = [...grpDef(r.yaml, "♻️ 自动选择")
+      .matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+    t(`只有免费设备时池子 ${pick.length} 个（精选端口，不测 IPv6）`, pick.length === 17);
+    t("池子里有「官方域名」那条兜底", pick.includes("官方域名"));
+  }
 }
 
 console.log(`\n通过 ${pass} 失败 ${fail}`);

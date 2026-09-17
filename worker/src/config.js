@@ -45,6 +45,46 @@ const CONSUMER_SNI = "consumer-masque.cloudflareclient.com";
 // CF 没有 A 记录指向 MASQUE 段，官方域名只能用在 SNI 上
 const SNI_NODE = ["162.159.198.1", 443];
 
+/** 拥塞控制档位。
+ *
+ * mihomo 的 masque 出站认 congestion-controller / cwnd / bbr-profile 三个键
+ * （adapter/outbound/masque.go 的 MasqueOption），最终交给
+ * transport/tuic/common/congestion.go 的 SetCongestionController：
+ *
+ *   cc 空串      -> 一个 case 都不命中，不下发，用 quic-go 内核默认（Cubic）
+ *   "cubic"      -> 显式 Cubic
+ *   "new_reno"   -> Cubic 的 Reno 变体
+ *   "bbr"        -> 走 congestion_v2.NewBbrSender（= bbr_meta_v2，BBR v2 移植）
+ *   "bbr_meta_v1"-> 老一代 BBR
+ *
+ * cwnd 的单位是**包**，不是字节：congestion_v2.NewBbrSender 的第二个形参虽然
+ * 类型写成 ByteCount，但函数体里会 `initialCongestionWindowPackets *
+ * initialMaxDatagramSize` 换算成字节再传下去。0 或不写 = 32 包。
+ * bbr-profile 只认 conservative / standard / aggressive，且只在 BBR 下生效。
+ *
+ * 为什么这是「网速」的第一杠杆：quic-go 默认的 Cubic 把丢包直接当拥塞信号，
+ * 手机上（尤其跨境 + 晚高峰）一丢包就把窗口砍半，单流吞吐直接掉一个档。
+ * BBR 改成拿带宽和 RTT 建模，丢包不砍窗口 —— 在丢包链路上单流吞吐高很多。
+ * cwnd 加大 = 开局就把窗口铺开，不用从 32 包慢慢爬上来。
+ *
+ * 三个档位是「按需切」的，不是固定的：激进在某些已经严重拥塞的小区网络上
+ * 会多打一些重传，所以留了回退键，管理页一键切。
+ */
+export const CC_PRESETS = {
+  extreme:  { label: "极速", cc: "bbr", cwnd: 128, profile: "aggressive" },
+  standard: { label: "标准", cc: "bbr", cwnd: 64,  profile: "standard" },
+  cubic:    { label: "回退", cc: "",    cwnd: 0,   profile: "" },
+};
+export const DEFAULT_CC = "standard";
+
+/** 把档位渲染成 masque 节点里的几行。cubic 档返回空串 = 完全不下发。 */
+function ccLines(preset) {
+  if (!preset || !preset.cc) return "";
+  return `\n    congestion-controller: ${preset.cc}` +
+         (preset.cwnd ? `\n    cwnd: ${preset.cwnd}` : "") +
+         (preset.profile ? `\n    bbr-profile: ${preset.profile}` : "");
+}
+
 const RS = "https://raw.githubusercontent.com";
 const RULESETS = [
   ["🎯 全球直连", RS + "/cmliu/ACL4SSR/refs/heads/main/Clash/CFnat.list"],
@@ -84,7 +124,7 @@ function entryName(ip, port) {
   return `${ip.split(".").slice(2).join(".")}-${port}`;
 }
 
-function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
+function masqueNode(name, ip, port, priv, pub, v4, v6, sni, cc = "") {
   // 裸 IPv6 含冒号，YAML 里必须加引号否则被当成映射
   const srv = ip.includes(":") ? `"${ip}"` : ip;
   const extra = sni ? `\n    sni: ${sni}` : "";
@@ -99,7 +139,7 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
     mtu: 1280
     udp: true
     remote-dns-resolve: true
-    dns: [1.1.1.1, 2606:4700:4700::1111]`;
+    dns: [1.1.1.1, 2606:4700:4700::1111]${cc}`;
 }
 
 /** 生成一台设备能用的全部 MASQUE 接入点。
@@ -120,7 +160,7 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni) {
  *   slot>=2 只出精选端口 x IPv4（16 个），节点名带 W2-/W3- 前缀。
  * 备胎不需要那么宽的回退面，但要能被「♻️ 自动选择」测到 —— 主力那台
  * 被 CF 清掉时，备胎是同一族里唯一还活着的节点。 */
-function buildEntries(dev, { slot = 1 } = {}) {
+function buildEntries(dev, { slot = 1, cc = "" } = {}) {
   const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = dev;
   // v4Entries 单独留一份：做 dialer-proxy 目标时只能用 IPv4，
   // 否则纯 IPv4 的机器上会直接 "network is unreachable"。
@@ -134,7 +174,7 @@ function buildEntries(dev, { slot = 1 } = {}) {
         const n = `ZT-${entryName(ip, port)}`;
         entries.push(n);
         v4Entries.push(n);
-        proxies.push(masqueNode(n, ip, port, priv, pub, v4, v6, ZT_SNI));
+        proxies.push(masqueNode(n, ip, port, priv, pub, v4, v6, ZT_SNI, cc));
       }
     }
     return { entries, proxies, v4Entries,
@@ -150,7 +190,7 @@ function buildEntries(dev, { slot = 1 } = {}) {
       const n = tag + entryName(ip, port);
       entries.push(n);
       if (!ip.includes(":")) v4Entries.push(n);
-      proxies.push(masqueNode(n, ip, port, priv, pub, v4, v6));
+      proxies.push(masqueNode(n, ip, port, priv, pub, v4, v6, "", cc));
     }
   }
   // 官方域名只给主力那份出。它是「用户能一眼看懂」的兜底节点，
@@ -159,7 +199,7 @@ function buildEntries(dev, { slot = 1 } = {}) {
     entries.push("官方域名");
     v4Entries.push("官方域名");   // 官方域名节点本身连的是 IPv4
     proxies.push(masqueNode("官方域名", SNI_NODE[0], SNI_NODE[1],
-                            priv, pub, v4, v6, CONSUMER_SNI));
+                            priv, pub, v4, v6, CONSUMER_SNI, cc));
   }
   return { entries, proxies, v4Entries, teamEntries: [], teamProxies: [] };
 }
@@ -550,12 +590,19 @@ ${p(picks)}
  * 3 台就是 48 个 —— 再多会把订阅撑得很难看，收益却很小。 */
 export const MAX_EXTRA_DEVICES = 3;
 
-export function buildConfig(warp, opera, proton, wind, ztDevice = null, extraWarps = []) {
+export function buildConfig(warp, opera, proton, wind, ztDevice = null, extraWarps = [],
+                            opts = {}) {
   let freeDev = warp, ztDev = ztDevice;
   if (warp && warp.zeroTrust) { ztDev = warp; freeDev = null; }
 
-  const free = freeDev ? buildEntries(freeDev, { slot: 1 }) : null;
-  const zteam = ztDev ? buildEntries(ztDev) : null;
+  // 拥塞控制档位。opts.cc 认不出来就退回默认档，不抛错 ——
+  // 一份订阅里少一个可选调优项，总好过整个页面打不开。
+  const ccKey = CC_PRESETS[opts.cc] ? opts.cc : DEFAULT_CC;
+  const ccPreset = CC_PRESETS[ccKey];
+  const ccExtra = ccLines(ccPreset);
+
+  const free = freeDev ? buildEntries(freeDev, { slot: 1, cc: ccExtra }) : null;
+  const zteam = ztDev ? buildEntries(ztDev, { cc: ccExtra }) : null;
 
   // 备用免费设备（备胎）。每台是**另一个免费账号、另一把密钥** ——
   // 主力那台被 CF 清掉 / 密钥失效时，这一族还有活节点在，不至于
@@ -564,7 +611,7 @@ export function buildConfig(warp, opera, proton, wind, ztDevice = null, extraWar
   const extras = (extraWarps || [])
     .filter((d) => d && d.privateKey && d.ipv4 && !d.zeroTrust)
     .slice(0, MAX_EXTRA_DEVICES)
-    .map((d, i) => buildEntries(d, { slot: i + 2 }));
+    .map((d, i) => buildEntries(d, { slot: i + 2, cc: ccExtra }));
 
   const freeEntries = free ? free.entries : [];
   const freeV4 = free ? free.v4Entries : [];
@@ -754,9 +801,9 @@ ${q(tags)}`).join("\n\n");
   - name: ZT团队边缘
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 120
-    tolerance: 30
-    timeout: 3000
+    interval: 90
+    tolerance: 15
+    timeout: 2500
     max-failed-times: 2
     lazy: false
     proxies:
@@ -855,6 +902,13 @@ ${zt ? `#   ZT团队边缘         本机 -> MASQUE(团队边缘 197.x) -> 目�
 #   本份应该有 免费边缘 ${freeEntries.length} 个 / ZT 团队边缘 ${teamEntries.length} 个。
 #   客户端里要是只看到 4 个 ZT 节点，说明导入的是旧配置，重新导入一次即可。
 #
+# 拥塞控制：全部 MASQUE 接入点走「${ccPreset.label}」档（${ccKey}）${
+  ccPreset.cc ? `，congestion-controller: ${ccPreset.cc}` +
+    (ccPreset.cwnd ? ` / cwnd: ${ccPreset.cwnd}` : "") +
+    (ccPreset.profile ? ` / bbr-profile: ${ccPreset.profile}` : "") : "（不下发，用内核默认 Cubic）"}。
+# 这是单流吞吐的第一杠杆：内核默认 Cubic 一丢包就砍窗口，手机上速度上不去；
+# BBR 用带宽+RTT 建模，丢包不砍窗口。要换档去管理页「拥塞控制」区块点一下。
+#
 # 需要 mihomo Alpha 分支：稳定版没有 masque outbound，也不认 dialer-proxy。
 # private-key 等同 WARP 账号凭据，别外传。
 
@@ -907,12 +961,17 @@ ${ztAggDef}${freeAggDef}
 ${streamExtra}${q(pickPool)}
 
   # 流媒体自动选优。只测精选池（手机上也测得完），开机就绪。
+  #
+  # interval 压到 90s、tolerance 收到 10ms：4K 是一整条持续几十 Mbps 的
+  # 单流，链路一抖就要立刻换，不能等三分钟。tolerance 小 = 只要新节点比
+  # 当前快 10ms 以上就切过去（url-test 的语义是「当前节点仍在前 tolerance
+  # 名内就不动」，越小越愿意换手）。
   - name: 🎬 流媒体自动
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 180
-    tolerance: 40
-    timeout: 3000
+    interval: 90
+    tolerance: 10
+    timeout: 2500
     max-failed-times: 2
     lazy: false
     proxies:
@@ -932,12 +991,26 @@ ${p(picks)}
   # 成员用精选池而不是全量：手机上并发 33 次 MASQUE 握手会被系统限流，
   # 测不完的直接标红，看着就像「节点全死了」。精选池 17 个够覆盖
   # 443/4443/8443/8095 四个代表性端口，要全量就在直连组里手选。
+  #
+  # ---- 「一直用上最快节点」就靠下面这五个参数 ----
+  # interval: 60  —— 一分钟重测一轮。测的是 HEAD（不是 GET 下载），
+  #   而且 unified-delay: true 会让它丢掉第一个请求、只用**已建好的隧道**
+  #   上的第二个请求计时，所以一轮的真实成本是每节点两个 HTTP 头，
+  #   数据量可忽略；QUIC 连接本身有 30s keepalive，重测不用重新握手。
+  # tolerance: 10 —— 只有新节点比当前快 10ms 以上才切，避免在两个
+  #   几乎一样快的节点之间来回跳。想更黏就把这个值调大。
+  # timeout: 2000 —— 超过 2 秒还没回头的节点不值得选，直接判失败。
+  # max-failed-times: 2 —— 故意不是 1。设成 1 时一次抖动就把好节点标死，
+  #   多节点同时抖动会让整组「看着全死」—— 那正是用户抱怨过的现象。
+  # lazy: false —— 开机即测，不等到第一次用这个组才测。
+  #
+  # 注意：手动钉死某一个具体节点 = 关掉这套自动优选。要一直最快就用组。
   - name: ♻️ 自动选择
     type: url-test
     url: http://www.gstatic.com/generate_204
-    interval: 180
-    tolerance: 40
-    timeout: 3000
+    interval: 60
+    tolerance: 10
+    timeout: 2000
     max-failed-times: 2
     lazy: false
     proxies:
@@ -1005,6 +1078,8 @@ ${rules}
   return { yaml, entries: frontAll.length, landings: opera.landings.length,
            combos, proton: protonNames.length, wind: windNames.length,
            zeroTrust: zt, teamEdges: teamEntries.length,
+           // 当前拥塞控制档位。UI 要显示它，也是排查「为什么还是慢」的第一手信息
+           cc: ccKey, ccLabel: ccPreset.label,
            freeEdges: freeEntries.length,
            // 备用免费设备：台数 + 它们的节点数。UI 要靠这两个数跟用户说清楚
            // 「免费族有几台设备在扛」，也是排查「一族全死」时的第一手信息。

@@ -117,5 +117,106 @@ const dev = (id, ip, extra = {}) => ({
   t("页面里没有 device token", !h.includes("SECRET-TOK"));
 }
 
+// ---- 拥塞控制档位 / WARP+ 授权码 ----
+// 这两块是「怎么一直用上超高速」的操作面：档位决定同一条链路跑多快，
+// 授权码决定走不走 CF 的优质骨干（Argo）。UI 上最容易出的问题是
+// 「state 里还没有这个字段 → 拼出 undefined」和「已生效了还显示输入框」，
+// 所以这里把有/无、成/败几种 state 都渲染一遍。
+{
+  const withStats = (extra) => ({ ...base,
+    stats: { entries: 71, freeEdges: 57, teamEdges: 14, landings: 12,
+             cc: "standard", ccLabel: "标准", ...extra } });
+
+  // ---- 档位区块 ----
+  {
+    const h = render(withStats());
+    t("有「拥塞控制」区块", h.includes("拥塞控制 · 单流速度的第一杠杆"));
+    t("显示当前档位（标准 / standard）", h.includes("标准（standard）"));
+    t("显示实际下发的参数", h.includes("bbr · cwnd 64 · standard"));
+    for (const k of ["extreme", "standard", "cubic"]) {
+      t(`有切到 ${k} 档的按钮`, h.includes(`setCC('${k}')`));
+    }
+    t("当前档位那个按钮打了勾", h.includes("标准 ✓"));
+    t("说明里点出 masque 出站认这三个键", h.includes("adapter/outbound/masque.go"));
+    t("说清内核默认是 Cubic 且丢包就砍窗口", h.includes("Cubic") && h.includes("砍半"));
+    t("说清 cwnd 单位是包不是字节", h.includes("单位是<b>包</b>"));
+    t("说明这是生成期开关、要重新导入", h.includes("重新导入一次订阅"));
+    t("把「回退」档解释成恢复原状", h.includes("等于完全恢复原状"));
+  }
+
+  // 极速档 / 回退档要显示不同的参数，不能永远显示默认那一行
+  {
+    const h1 = render(withStats({ cc: "extreme", ccLabel: "极速" }));
+    t("极速档显示 cwnd 128 / aggressive",
+      h1.includes("bbr · cwnd 128 · aggressive") && h1.includes("极速（extreme）"));
+    t("极速档打勾打在极速上", h1.includes("极速 ✓"));
+
+    const h2 = render(withStats({ cc: "cubic", ccLabel: "回退" }));
+    t("回退档显示「不下发」而不是空的",
+      h2.includes("不下发，用内核默认 Cubic"));
+    t("回退档打勾打在回退上", h2.includes("回退 ✓"));
+  }
+
+  // stats 里没有 cc（老 state / 空 state）时不能拼出 undefined
+  {
+    const h = render({ ...base, stats: { freeEdges: 57 } });
+    t("stats 缺 cc 时退回默认档", h.includes("标准（standard）"));
+    t("stats 缺 cc 时不出现 undefined", !/undefined/.test(h.split("拥塞控制")[1].split("</div>\n    </div>")[0]));
+  }
+
+  // ---- WARP+ 区块 ----
+  {
+    const h = render(withStats());
+    t("有「WARP+ 极速通道」区块", h.includes("WARP+ 极速通道"));
+    t("没查过就说「未查询」", h.includes("未查询"));
+    t("没查过时给输入框", h.includes('id="lic"'));
+    t("有两个按钮：绑当前设备 / 换新设备",
+      h.includes("bindLic(false)") && h.includes("bindLic(true)"));
+    t("输入框带格式提示", h.includes("XXXXXXXX-XXXXXXXXX-XXXXXXXXXX"));
+    t("说明里点出走 Argo 智能选路", h.includes("Argo"));
+    t("说清授权码在 1.1.1.1 App 里取", h.includes("1.1.1.1 App"));
+    t("说清只认官方买的码", h.includes("只认官方买的"));
+    t("解释了两个按钮的区别", h.includes("已经连过 WARP 的账号"));
+    t("提醒一个码只能绑一个账号", h.includes("同一时间只能绑一个账号"));
+  }
+
+  // 已生效：显示 WARP+ 并撤掉输入框（避免用户重复提交）
+  {
+    const h = render({ ...withStats(),
+      license: { at: iso(now), warpPlus: true, premiumData: 5 * 1073741824, quota: 0 } });
+    t("已生效时显示 WARP+ 已启用", h.includes("WARP+ 已启用"));
+    t("已生效时显示剩余额度", h.includes("剩余 5.00 GB"));
+    t("已生效时不再显示输入框", !h.includes('id="lic"'));
+    t("已生效时不再显示那两个按钮中依赖输入框的那个", !h.includes("bindLic(false)"));
+  }
+
+  // 半成功：CF 收下了但没生效 —— 必须留着输入框和「换新设备」这条路
+  {
+    const h = render({ ...withStats(), license: { at: iso(now), warpPlus: false } });
+    t("没生效时显示「免费版」并标注查询时间", h.includes("免费版（"));
+    t("没生效时仍显示输入框", h.includes('id="lic"'));
+    t("没生效时仍能点「换新设备再绑定」", h.includes("bindLic(true)"));
+    t("没生效时不显示 WARP+ 已启用", !h.includes("WARP+ 已启用"));
+  }
+
+  // ---- 节点区块那条「别钉死单个节点」的提示 ----
+  {
+    const h = render(withStats());
+    t("提示别手动钉死单个节点", h.includes("别手动钉死某一个具体节点"));
+    t("指路 ♻️ 自动选择 并写清 60 秒 / 10ms", h.includes("60 秒重测") && h.includes("10ms"));
+    t("指路 🔄 故障转移 给「绝不自动换」的人", h.includes("🔄 故障转移"));
+    t("指路 WARP直连 给想手选的人", h.includes("WARP直连"));
+  }
+
+  // ---- 降级：空 state 也得能渲染 ----
+  {
+    let h = null;
+    try { h = render({}); } catch (e) { h = null; }
+    t("空 state 下两个新区块也能渲染",
+      !!h && h.includes("拥塞控制") && h.includes("WARP+ 极速通道") && h.includes('id="lic"'));
+    t("空 state 下档位显示默认而不是崩溃", !!h && h.includes("标准（standard）"));
+  }
+}
+
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);

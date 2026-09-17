@@ -13,3 +13,6 @@ worker/package-lock.json
 
 # worker/dist 是网页部署要用的单文件，必须提交
 !worker/dist/
+
+__pycache__/
+*.pyc

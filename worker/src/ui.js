@@ -1,4 +1,4 @@
-import { MAX_EXTRA_DEVICES } from "./config.js";
+import { MAX_EXTRA_DEVICES, CC_PRESETS, DEFAULT_CC } from "./config.js";
 
 // 界面沿用 cfnew 的赛博朋克终端风：青/品红霓虹、等宽字体、扫描线。
 const CSS = `
@@ -247,6 +247,15 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
     devRows.push({ role: "Zero Trust 团队设备", d: ztDevice });
   }
 
+  // ---- 拥塞控制档位 / WARP+ ----
+  // 这两个是「网速」上的两个开关，所以要显示当前状态，不能只给按钮。
+  const ccNow = CC_PRESETS[(stat.cc || DEFAULT_CC)] ? (stat.cc || DEFAULT_CC) : DEFAULT_CC;
+  const ccNowP = CC_PRESETS[ccNow];
+  const lic = s.license || null;
+  const licPlus = lic && lic.warpPlus === true;
+  const gb2 = (b) => b ? (b / 1073741824).toFixed(2) + " GB" : "";
+  const licLeft = lic && lic.premiumData ? ` · 剩余 ${gb2(lic.premiumData)}` : "";
+
   const row = (k, v, cls = "") =>
     `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
 
@@ -384,7 +393,76 @@ export function renderUI(state, host, sp, token, cred, pushToken, protonCred, wi
         <b>数量对不上就是导入的旧配置</b>：本份应有免费边缘 ${stat.freeEdges || 0} 个、
         ZT 团队边缘 ${stat.teamEdges || 0} 个接入点${stat.extraEdges ? `、备胎 ${stat.extraEdges} 个` : ""}。
         客户端里只看到 4 个 ZT 节点（或免费节点明显少一截），
-        就是配置没更新 —— 回上面重新复制订阅链接、导入一次即可。
+        就是配置没更新 —— 回上面重新复制订阅链接、导入一次即可。<br>
+        <b>想一直跑在最快的接入点上，就别手动钉死某一个具体节点。</b>
+        钉死 = 关掉自动优选，那条链路一慢你就只能干等。用
+        <b>♻️ 自动选择</b>（每 60 秒重测一轮，新节点快出 10ms 以上就换手）；
+        要「绝不自动换、只求一直连得上」就用 <b>🔄 故障转移</b>。
+        想看全部 57 个接入点、手动挑，用 <b>WARP直连</b>。
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">拥塞控制 · 单流速度的第一杠杆</div>
+      ${row("当前档位", `${ccNowP.label}（${ccNow}）`,
+             ccNow === "extreme" ? "ok" : ccNow === "standard" ? "ok" : "warn")}
+      ${row("下发参数", ccNowP.cc
+        ? [ccNowP.cc,
+           ccNowP.cwnd ? "cwnd " + ccNowP.cwnd : "",
+           ccNowP.profile || ""].filter(Boolean).join(" · ")
+        : "不下发，用内核默认 Cubic（最保守，也最慢）")}
+      <div class="sub" style="margin-top:12px">
+        ${Object.entries(CC_PRESETS).map(([k, v]) =>
+          `<button class="${k === ccNow ? "" : "gh"}" onclick="setCC('${k}')">` +
+          `${v.label}${k === ccNow ? " ✓" : ""}</button>`).join("")}
+      </div>
+      <div class="note">
+        <b>为什么这个开关比换节点更管用</b>：mihomo 的 masque 出站认
+        <code>congestion-controller</code> / <code>cwnd</code> /
+        <code>bbr-profile</code>（见 <code>adapter/outbound/masque.go</code>）。
+        不写这三个键时用的是内核默认 <b>Cubic</b> —— Cubic 把<b>丢包直接当成拥塞</b>，
+        手机上（尤其跨境 + 晚高峰）一丢包就把窗口砍半，4K 立刻降码率。
+        <b>BBR</b> 改成拿带宽和 RTT 建模，丢包不砍窗口，单流吞吐高一个档。
+        <code>cwnd</code> 是初始窗口（单位是<b>包</b>，内核默认 32），
+        加大 = 开局就把窗口铺满，不用慢慢爬。<br>
+        <b>极速</b>：BBR + cwnd 128 + aggressive，单流吞吐最大，
+        丢包也硬冲（小区网络特别拥堵时可能多打些重传）。<br>
+        <b>标准</b>：BBR + cwnd 64 + standard，默认档，抗丢包又不霸占链路。<br>
+        <b>回退</b>：不下发，回到内核默认 Cubic。<b>换档无效、或者觉得线路被
+        我们拖慢了</b>，切到这个档再试 —— 它等于完全恢复原状。<br>
+        ⚠️ 这是<b>生成期</b>开关，改完必须<b>重新导入一次订阅</b>才生效。
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-t">WARP+ 极速通道 · 授权码绑到账号上</div>
+      ${row("账号状态", lic === null
+             ? "未查询（点上面「设备体检」或下面按钮）"
+             : licPlus
+               ? `WARP+ 已启用${licLeft}`
+               : `免费版${lic.at ? "（" + fmt(new Date(lic.at)) + " 查的）" : ""}`,
+             lic === null ? "" : licPlus ? "ok" : "warn")}
+      ${licPlus ? "" : `
+      <div class="sub" style="margin-top:12px">
+        <input id="lic" placeholder="粘 WARP+ 授权码：XXXXXXXX-XXXXXXXXX-XXXXXXXXXX"
+               spellcheck="false" autocomplete="off">
+        <button onclick="bindLic(false)">绑定到当前设备</button>
+        <button class="gh" onclick="bindLic(true)">换新设备再绑定</button>
+      </div>`}
+      <div class="note">
+        <b>这是单流速度上最大的一根杠杆。</b>免费版走的是 CF 共享的普通出口，
+        容易被出口拥塞和链路 QoS 拖住；绑上授权码后账号变成 <b>WARP+</b>，
+        流量改走 Cloudflare 的 <b>Argo 智能选路</b>（CF 自己的优质骨干），
+        速度明显更高、也更稳。WARP 的免费边缘和 ZT 团队边缘都吃这个账号，
+        所以绑一次全族受益。<br>
+        授权码在官方 <b>1.1.1.1 App</b> 里：Account &gt; Key。
+        <b>只认官方买的</b>，靠推荐 / 活动拿到的码 CF 会直接拒。<br>
+        <b>两个按钮的区别</b>：「绑定到当前设备」最温和，不动设备号；
+        如果绑完 <code>warp_plus</code> 还是 <code>false</code>，就用
+        <b>「换新设备再绑定」</b> —— CF 侧有个老问题：<b>已经连过 WARP 的账号</b>
+        绑了也可能不生效，正解是注册一台干净设备、在它连任何一次之前把码绑上。<br>
+        一个授权码同一时间只能绑一个账号。CF 说「已被占用」的话，
+        先在 1.1.1.1 App 里把其他设备解绑。
       </div>
     </div>
 
@@ -670,6 +748,34 @@ async function go(p){
     const j=await r.json();
     if(j.ok){say(j.msg+'，即将刷新','var(--mint)');setTimeout(()=>location.reload(),1200);}
     else{say('失败: '+j.error,'var(--red)');bs.forEach(b=>b.disabled=false);}
+  }catch(e){say('失败: '+e.message,'var(--red)');bs.forEach(b=>b.disabled=false);}
+}
+async function setCC(k){
+  post('/api/cc',{cc:k},'已切换');
+}
+// 授权码不能复用 post()：绑定「被接受但 warp_plus 仍是 false」是常见结果，
+// 那种情况要留在页面上把原因读完，不能自动刷新跑掉。
+async function bindLic(fresh){
+  const el=document.getElementById('lic');
+  const k=el?el.value.trim():'';
+  if(!k){say('先把授权码粘进来','var(--red)');return;}
+  const bs=document.querySelectorAll('button');
+  bs.forEach(b=>b.disabled=true);
+  say('正在向 Cloudflare 提交…','var(--yellow)');
+  try{
+    const r=await fetch('/api/warp/license',{method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({key:k,fresh:!!fresh})});
+    const j=await r.json();
+    if(!j.ok){say('失败: '+j.error,'var(--red)');bs.forEach(b=>b.disabled=false);return;}
+    if(j.warpPlus){
+      say(j.msg,'var(--mint)');
+      setTimeout(()=>location.reload(),2200);
+    }else{
+      // 不刷新：这句话用户必须读完才知道下一步点哪个按钮
+      say(j.msg,'var(--yellow)');
+      bs.forEach(b=>b.disabled=false);
+    }
   }catch(e){say('失败: '+e.message,'var(--red)');bs.forEach(b=>b.disabled=false);}
 }
 async function enrollZt(){
