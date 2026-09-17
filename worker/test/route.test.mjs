@@ -733,6 +733,10 @@ t("新密码能登上",
   const realFetch = globalThis.fetch;
   const calls = [];
   let licWarpPlus = true;   // PUT /account 之后 CF 说账号是什么状态
+  // GET /account（体检）时 CF 报告的账号状态。单独一个变量，
+  // 才能模拟「用户先在 1.1.1.1 App 里把码绑上，再回来点体检」
+  // 这种本地还没有记录、但账号其实已经是 WARP+ 的翻转场景。
+  let acctWarpPlus = true;
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url), m = init.method || "GET";
     if (u.includes("api2.sec-tunnel.com")) {
@@ -758,8 +762,9 @@ t("新密码能登上",
       if (m === "GET" && u.includes("/account")) {
         calls.push("get-account");
         return new Response(JSON.stringify({
-          license: "AAAA-BBBB-CCCC", warp_plus: true,
-          premium_data: 7 * 1073741824, quota: 0, account_type: "warp_plus",
+          license: "AAAA-BBBB-CCCC", warp_plus: acctWarpPlus,
+          premium_data: acctWarpPlus ? 7 * 1073741824 : 0, quota: 0,
+          account_type: acctWarpPlus ? "warp_plus" : "free",
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
       if (m === "POST" && u.endsWith("/reg")) {
@@ -878,6 +883,87 @@ t("新密码能登上",
   t("体检把账号状态写回 KV，管理页不用再打 CF", !!kv.get("warp:license"));
   t("写回的状态里 warp_plus 正确",
     JSON.parse(kv.get("warp:license")).warpPlus === true);
+
+  // ---- WARP+ 状态 -> 节点名的 "W+ " 前缀 ----
+  //
+  // 用户问过「我怎么在客户端选 WARP+ 的节点」。真相是 WARP+ 属于**账号**，
+  // 不是一个单独的节点：绑上之后免费边缘那一族整族走 Argo。原先客户端里
+  // 没有任何线索，用户只会以为没生效或者一直在找「WARP+ 那一组」。
+  //
+  // 这里守住四件事：
+  //   1. 没绑 -> 一个 W+ 都不加（老行为不变，不能默认就改名字）；
+  //   2. 绑上 -> 免费边缘整族（含「官方域名」）都带前缀，且密钥不变；
+  //   3. 备胎不带（另一台账号）、组引用跟着改名（否则全是悬空引用）；
+  //   4. 体检发现状态翻转时要**自动重建** —— 用户往往先在 1.1.1.1 App
+  //      里绑码，再回来点体检，不重建就永远看不见前缀。
+  {
+    // 放一台备胎进去，才能验证「W+ 只加在主力那族上」
+    kv.set("warp:devices:extra", JSON.stringify([{
+      deviceId: "dev-alt", token: "tok-a",
+      privateKey: "ALT1_PRIV", peerPublicKey: "ALT1_PUB",
+      ipv4: "172.16.1.2", ipv6: "2606:4700:110:1::2",
+      registeredAt: new Date().toISOString(), accountType: "free",
+    }]));
+
+    const grp = (name) => {
+      const i = y0().indexOf(`  - name: ${name}\n`);
+      return i < 0 ? "" : y0().slice(i, y0().indexOf("\n  - name:", i + 10));
+    };
+    const y0 = () => kv.get("config:yaml");
+    const nb = (name) => {
+      const i = y0().indexOf(`  - name: ${name}\n`);
+      return i < 0 ? "" : y0().slice(i, y0().indexOf("\n  - name:", i + 10));
+    };
+
+    // (1) 没绑授权码：切一次档位触发重建（rebuild 会读 K_LIC）
+    // license 字段故意预置一个「前 4 位」，验证体检不会把它擦掉。
+    kv.set("warp:license", JSON.stringify({
+      warpPlus: false, at: new Date().toISOString(), license: "1111\u2026" }));
+    const cc0 = await worker.fetch(post("/api/cc", { cc: "standard" }, ah), env);
+    t("没绑授权码时切档位照样成功", cc0.status === 200);
+    t("没绑授权码时节点名一个 W+ 都没有", !y0().includes("W+ "));
+    t("没绑授权码时 state.stats.warpPlus 是 false",
+      JSON.parse(kv.get("state:meta")).stats.warpPlus === false);
+    t("主力节点名保持原样（198.1-443）", y0().includes("name: 198.1-443"));
+    t("备胎节点名仍是 W2- 开头", y0().includes("name: W2-198.1-443"));
+
+    // (2) 体检发现账号其实已经是 WARP+（用户可能在 App 里绑过）-> 翻转
+    const dg2 = await worker.fetch(post("/api/diag", {}, ah), env);
+    const dg2j = await dg2.json();
+    const stOn = JSON.parse(kv.get("state:meta"));
+    t("体检发现 WARP+ 状态翻转后自动重建（state 变 true）",
+      stOn.stats.warpPlus === true);
+    t("免费边缘节点名带上 W+ 前缀", y0().includes("name: W+ 198.1-443"));
+    t("「官方域名」节点也跟着带前缀", y0().includes("name: W+ 官方域名"));
+    // 注意：这个块跑到这里时，KV 里的主力设备已经被上一段「换新设备再绑定」
+    // 换成 dev-fresh 了，所以不能拿最早的 PK-PRIMARY 去比 —— 要跟 KV 里
+    // **当前**那台设备的密钥比，这才真的验证了「改名不动钥匙」。
+    const curKey = JSON.parse(kv.get("warp:device")).privateKey;
+    t("只是改名，密钥没动（还是 KV 里那台设备的钥匙）",
+      !!curKey && nb("W+ 198.1-443").includes(`private-key: ${curKey}`));
+    t("接入点总数没变（只是改名，没加节点）",
+      stOn.stats.entries === 57 + stOn.stats.extraEdges);
+    t("备胎不受影响（W2- 不带 W+）",
+      y0().includes("name: W2-198.1-443") && !y0().includes("name: W+ W2-"));
+    t("WARP直连 组的成员名跟着改名，不留悬空引用",
+      /- "W\+ 198\.1-443"/.test(grp("WARP直连")) && /- "W\+ 官方域名"/.test(grp("WARP直连")));
+    t("组里不再有旧名引用", !/- "198\.1-443"/.test(y0()));
+    t("自动选择池子里也能看到 W+ 节点",
+      /- "W\+ 198\.1-443"/.test(grp("♻️ 自动选择")));
+    t("体检提示里讲清节点名变了、要重新导入",
+      /W\+/.test(dg2j.msg) && /重新导入/.test(dg2j.msg));
+
+    // (3) 反向：账号不再是 WARP+ -> 前缀要去掉，不能粘着不走
+    acctWarpPlus = false;
+    const dg3 = await worker.fetch(post("/api/diag", {}, ah), env);
+    const dg3j = await dg3.json();
+    t("账号掉出 WARP+ 时前缀被去掉",
+      !y0().includes("W+ ") && JSON.parse(kv.get("state:meta")).stats.warpPlus === false);
+    t("掉出 WARP+ 时提示也说明了要重新导入",
+      /重新导入/.test(dg3j.msg));
+    t("体检保留了授权码前 4 位（不被体检擦掉）",
+      JSON.parse(kv.get("warp:license")).license === "1111\u2026");
+  }
 
   globalThis.fetch = realFetch;
 }

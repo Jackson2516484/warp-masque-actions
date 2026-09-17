@@ -611,10 +611,10 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni, cc = "") {
     remote-dns-resolve: true
     dns: [1.1.1.1, 2606:4700:4700::1111]${cc}`;
 }
-function buildEntries(dev, { slot = 1, cc = "" } = {}) {
+function buildEntries(dev, { slot = 1, cc = "", plus = false } = {}) {
   const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = dev;
   const entries = [], v4Entries = [], proxies = [];
-  const tag = slot > 1 ? `W${slot}-` : "";
+  const tag = slot > 1 ? `W${slot}-` : plus ? "W+ " : "";
   if (zeroTrust) {
     for (const ip of TEAM_V4) {
       for (const port of TEAM_PORTS) {
@@ -643,10 +643,11 @@ function buildEntries(dev, { slot = 1, cc = "" } = {}) {
     }
   }
   if (slot === 1) {
-    entries.push("\u5B98\u65B9\u57DF\u540D");
-    v4Entries.push("\u5B98\u65B9\u57DF\u540D");
+    const offName = tag + "\u5B98\u65B9\u57DF\u540D";
+    entries.push(offName);
+    v4Entries.push(offName);
     proxies.push(masqueNode(
-      "\u5B98\u65B9\u57DF\u540D",
+      offName,
       SNI_NODE[0],
       SNI_NODE[1],
       priv,
@@ -1091,7 +1092,8 @@ function buildConfig(warp, opera, proton, wind, ztDevice = null, extraWarps = []
   const ccKey = CC_PRESETS[opts.cc] ? opts.cc : DEFAULT_CC;
   const ccPreset = CC_PRESETS[ccKey];
   const ccExtra = ccLines(ccPreset);
-  const free = freeDev ? buildEntries(freeDev, { slot: 1, cc: ccExtra }) : null;
+  const plus = opts.warpPlus === true;
+  const free = freeDev ? buildEntries(freeDev, { slot: 1, cc: ccExtra, plus }) : null;
   const zteam = ztDev ? buildEntries(ztDev, { cc: ccExtra }) : null;
   const extras = (extraWarps || []).filter((d) => d && d.privateKey && d.ipv4 && !d.zeroTrust).slice(0, MAX_EXTRA_DEVICES).map((d, i) => buildEntries(d, { slot: i + 2, cc: ccExtra }));
   const freeEntries = free ? free.entries : [];
@@ -1279,7 +1281,10 @@ ${zt ? `#   ZT\u56E2\u961F\u8FB9\u7F18         \u672C\u673A -> MASQUE(\u56E2\u96
 # ZT- \u5F00\u5934\u7684\u662F Zero Trust \u56E2\u961F\u8FB9\u7F18\u8282\u70B9\uFF08162.159.197.x\uFF09\u3002
 # W2- / W3- \u5F00\u5934\u7684\u662F**\u5907\u7528\u514D\u8D39\u8BBE\u5907**\u7684\u63A5\u5165\u70B9\uFF08\u53E6\u4E00\u628A\u5BC6\u94A5\u3001\u53E6\u4E00\u4E2A\u8D26\u53F7\uFF0C
 # \u53EA\u51FA 443 / 8095 \u4E24\u4E2A\u7AEF\u53E3 \u2014\u2014 \u5B83\u4EEC\u662F\u4E3B\u529B\u8BBE\u5907\u7684\u5907\u80CE\uFF0C\u4E0D\u662F\u4E3B\u529B\uFF09\u3002
-#
+${plus ? `# W+ \u5F00\u5934\u7684\u662F**\u5DF2\u7ED1 WARP+ \u6388\u6743\u7801**\u7684\u8282\u70B9\uFF1A\u514D\u8D39\u8FB9\u7F18\u90A3\u4E00\u65CF\u6574\u65CF\u8D70 CF \u7684
+#    Argo \u4F18\u8D28\u9AA8\u5E72\u3002\u6388\u6743\u7801\u662F\u8D26\u53F7\u5C5E\u6027\uFF0C\u5BA2\u6237\u7AEF\u91CC\u6CA1\u6709\u5355\u72EC\u7684\u300CWARP+ \u5206\u7EC4\u300D
+#    \u53EF\u9009 \u2014\u2014 \u8FD9\u4E00\u65CF\u7684\u6BCF\u4E2A\u8282\u70B9\u90FD\u662F WARP+\u3002\u5907\u80CE\uFF08W2-/W3-\uFF09\u4E0D\u5728\u91CC\u9762\u3002
+` : ""}#
 # \u63A5\u5165\u70B9\u5171 ${frontAll.length} \u4E2A\uFF08\u514D\u8D39\u8FB9\u7F18 ${freeEntries.length}${extraEntries.length ? ` + \u5907\u7528\u514D\u8D39 ${extraEntries.length}` : ""} + ZT \u56E2\u961F\u8FB9\u7F18 ${teamEntries.length}\uFF09
 # x \u843D\u5730 ${opera.landings.length} \u4E2A = \u7EC4\u5408 ${combos} \u4E2A${protonNames.length ? `\uFF0C\u5916\u52A0 ${protonNames.length} \u4E2A Proton \u843D\u5730` : ""}${windNames.length ? ` \u548C ${windNames.length} \u4E2A Windscribe \u843D\u5730` : ""}\u3002
 # \u4EFB\u4E00\u73AF\u5931\u6548\u90FD\u6709\u66FF\u4EE3\u8DEF\u5F84\uFF1B\u67D0\u4E2A\u65CF\u6574\u4F53\u4E0D\u53EF\u7528\u65F6\uFF0C\u53E6\u5916\u4E24\u65CF\u7167\u5E38\u5DE5\u4F5C\u3002
@@ -1468,6 +1473,8 @@ ${rules}
     // 当前拥塞控制档位。UI 要显示它，也是排查「为什么还是慢」的第一手信息
     cc: ccKey,
     ccLabel: ccPreset.label,
+    // WARP+ 是否已生效（决定节点名有没有 "W+ " 前缀）。UI 要显示它。
+    warpPlus: plus,
     freeEdges: freeEntries.length,
     // 备用免费设备：台数 + 它们的节点数。UI 要靠这两个数跟用户说清楚
     // 「免费族有几台设备在扛」，也是排查「一族全死」时的第一手信息。
@@ -1960,6 +1967,9 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         <b>ZT-</b> \u5F00\u5934\u7684\u662F Zero Trust \u56E2\u961F\u8FB9\u7F18\uFF08162.159.197.x\uFF09\uFF0C\u7528\u56E2\u961F\u5BC6\u94A5\uFF1B
         \u5176\u4F59\u63A5\u5165\u70B9\u7528\u514D\u8D39 WARP \u5BC6\u94A5\u3002<b>\u4E24\u65CF\u5E76\u5B58</b>\uFF0C\u4E00\u65CF\u6574\u4F53\u8FDE\u4E0D\u4E0A\u65F6\u53E6\u4E00\u65CF\u7167\u5E38\u5DE5\u4F5C \u2014\u2014
         \u7528 \u26A1 \u805A\u5408WARP / \u26A1 \u805A\u5408ZT \u5207\u5F00\u6D4B\u4E00\u4E0B\u5EF6\u8FDF\uFF0C\u5C31\u77E5\u9053\u662F\u54EA\u4E00\u65CF\u7684\u95EE\u9898\u3002<br>
+        <b>W+&nbsp;</b> \u5F00\u5934\u7684\u662F<b>\u5DF2\u7ED1 WARP+ \u6388\u6743\u7801</b>\u7684\u63A5\u5165\u70B9\uFF08\u514D\u8D39\u8FB9\u7F18\u90A3\u4E00\u65CF
+        \u6574\u65CF\u8D70 Argo\uFF0C\u89C1\u4E0A\u9762\u300CWARP+ \u6781\u901F\u901A\u9053\u300D\u533A\u5757\uFF09\u3002\u770B\u5230\u8FD9\u4E2A\u6807\u8BB0\u5C31\u8BF4\u660E\u6388\u6743\u7801
+        \u751F\u6548\u4E86\uFF1B\u6CA1\u6709 W+ \u5C31\u8BF4\u660E\u8FD9\u53F0\u8D26\u53F7\u8FD8\u662F\u514D\u8D39\u7248\u3002<br>
         <b>\u6570\u91CF\u5BF9\u4E0D\u4E0A\u5C31\u662F\u5BFC\u5165\u7684\u65E7\u914D\u7F6E</b>\uFF1A\u672C\u4EFD\u5E94\u6709\u514D\u8D39\u8FB9\u7F18 ${stat.freeEdges || 0} \u4E2A\u3001
         ZT \u56E2\u961F\u8FB9\u7F18 ${stat.teamEdges || 0} \u4E2A\u63A5\u5165\u70B9${stat.extraEdges ? `\u3001\u5907\u80CE ${stat.extraEdges} \u4E2A` : ""}\u3002
         \u5BA2\u6237\u7AEF\u91CC\u53EA\u770B\u5230 4 \u4E2A ZT \u8282\u70B9\uFF08\u6216\u514D\u8D39\u8282\u70B9\u660E\u663E\u5C11\u4E00\u622A\uFF09\uFF0C
@@ -2023,8 +2033,18 @@ function renderUI(state, host, sp, token, cred, pushToken, protonCred, windUsage
         <b>\u8FD9\u662F\u5355\u6D41\u901F\u5EA6\u4E0A\u6700\u5927\u7684\u4E00\u6839\u6760\u6746\u3002</b>\u514D\u8D39\u7248\u8D70\u7684\u662F CF \u5171\u4EAB\u7684\u666E\u901A\u51FA\u53E3\uFF0C
         \u5BB9\u6613\u88AB\u51FA\u53E3\u62E5\u585E\u548C\u94FE\u8DEF QoS \u62D6\u4F4F\uFF1B\u7ED1\u4E0A\u6388\u6743\u7801\u540E\u8D26\u53F7\u53D8\u6210 <b>WARP+</b>\uFF0C
         \u6D41\u91CF\u6539\u8D70 Cloudflare \u7684 <b>Argo \u667A\u80FD\u9009\u8DEF</b>\uFF08CF \u81EA\u5DF1\u7684\u4F18\u8D28\u9AA8\u5E72\uFF09\uFF0C
-        \u901F\u5EA6\u660E\u663E\u66F4\u9AD8\u3001\u4E5F\u66F4\u7A33\u3002WARP \u7684\u514D\u8D39\u8FB9\u7F18\u548C ZT \u56E2\u961F\u8FB9\u7F18\u90FD\u5403\u8FD9\u4E2A\u8D26\u53F7\uFF0C
-        \u6240\u4EE5\u7ED1\u4E00\u6B21\u5168\u65CF\u53D7\u76CA\u3002<br>
+        \u901F\u5EA6\u660E\u663E\u66F4\u9AD8\u3001\u4E5F\u66F4\u7A33\u3002<br>
+        <b>\u5BA2\u6237\u7AEF\u91CC\u600E\u4E48\u300C\u9009\u300DWARP+ \u8282\u70B9 \u2014\u2014 \u6CA1\u5F97\u9009\uFF0C\u6574\u65CF\u90FD\u662F\u3002</b>
+        \u6388\u6743\u7801\u662F\u7ED1\u5728<b>\u8D26\u53F7</b>\u4E0A\u3001\u4E0D\u662F\u7ED1\u5728<b>\u8282\u70B9</b>\u4E0A\u7684\uFF0C\u6240\u4EE5\u5B83\u4E0D\u4F1A\u53E6\u5916
+        \u957F\u51FA\u4E00\u4EFD\u5355\u72EC\u7684\u8282\u70B9\u3002\u7ED1\u6210\u529F\u540E\uFF0C\u514D\u8D39\u8FB9\u7F18\u90A3\u4E00\u65CF
+        \uFF08198/199 \u90A3 ${stat.freeEdges || 0} \u4E2A\u63A5\u5165\u70B9\uFF09<b>\u6BCF\u4E00\u4E2A\u90FD\u6539\u8D70 Argo</b>\uFF0C
+        \u8282\u70B9\u540D\u524D\u9762\u4F1A\u7EDF\u4E00\u591A\u51FA\u4E00\u4E2A <b>W+&nbsp;</b> \u6807\u8BB0 \u2014\u2014 \u91CD\u65B0\u5BFC\u5165\u4E00\u6B21\u8BA2\u9605
+        \u5C31\u80FD\u770B\u5230\u3002\u5BA2\u6237\u7AEF\u91CC\u7684\u7528\u6CD5\u5B8C\u5168\u4E0D\u53D8\uFF1A<b>\u{1F680} \u8282\u70B9\u9009\u62E9 \u2192 \u267B\uFE0F \u81EA\u52A8\u9009\u62E9</b>\uFF0C
+        \u6216\u8005\u624B\u9009\u4EFB\u4F55\u4E00\u4E2A <b>W+&nbsp;</b> \u5F00\u5934\u7684\u63A5\u5165\u70B9\u3002<br>
+        <b>\u54EA\u4E9B\u8282\u70B9\u4E0D\u5E26 W+</b>\uFF1A\u5907\u80CE\uFF08<b>W2-</b>/<b>W3-</b>\uFF09\u662F\u53E6\u4E00\u53F0\u8D26\u53F7\u3001
+        \u53E6\u4E00\u628A\u5BC6\u94A5\uFF0C\u800C\u4E00\u4E2A\u6388\u6743\u7801\u540C\u4E00\u65F6\u95F4\u53EA\u80FD\u7ED1\u4E00\u4E2A\u8D26\u53F7\uFF0C\u6240\u4EE5\u5B83<b>\u4E0D\u8986\u76D6</b>
+        \u5907\u80CE\uFF1B<b>ZT \u56E2\u961F\u8FB9\u7F18</b>\u8D70\u7684\u662F\u56E2\u961F\u5BC6\u94A5\u548C\u56E2\u961F\u8FB9\u7F18\uFF0C\u6D88\u8D39\u7248\u6388\u6743\u7801
+        \u7ED1\u4E0D\u4E0A\u53BB\uFF08\u5B83\u672C\u6765\u5C31\u8D70 CF \u81EA\u5DF1\u7684\u9AA8\u5E72\uFF0C\u4E0D\u9700\u8981\u7ED1\uFF09\u3002<br>
         \u6388\u6743\u7801\u5728\u5B98\u65B9 <b>1.1.1.1 App</b> \u91CC\uFF1AAccount &gt; Key\u3002
         <b>\u53EA\u8BA4\u5B98\u65B9\u4E70\u7684</b>\uFF0C\u9760\u63A8\u8350 / \u6D3B\u52A8\u62FF\u5230\u7684\u7801 CF \u4F1A\u76F4\u63A5\u62D2\u3002<br>
         <b>\u4E24\u4E2A\u6309\u94AE\u7684\u533A\u522B</b>\uFF1A\u300C\u7ED1\u5B9A\u5230\u5F53\u524D\u8BBE\u5907\u300D\u6700\u6E29\u548C\uFF0C\u4E0D\u52A8\u8BBE\u5907\u53F7\uFF1B
@@ -2520,6 +2540,7 @@ async function rebuild(env, { forceWarp = false } = {}) {
   }
   const extras = await getExtraWarps(env);
   const settings = await getSettings(env);
+  const licRec = await env.KV.get(K_LIC, "json");
   const {
     yaml,
     entries,
@@ -2533,8 +2554,17 @@ async function rebuild(env, { forceWarp = false } = {}) {
     extraDevices,
     extraEdges,
     cc,
-    ccLabel
-  } = buildConfig(warp, opera, proton, wind, ztDev, extras, { cc: settings.cc });
+    ccLabel,
+    warpPlus
+  } = buildConfig(
+    warp,
+    opera,
+    proton,
+    wind,
+    ztDev,
+    extras,
+    { cc: settings.cc, warpPlus: !!(licRec && licRec.warpPlus) }
+  );
   const now = Date.now();
   const devInfo = (d) => d ? {
     deviceId: d.deviceId,
@@ -2558,7 +2588,8 @@ async function rebuild(env, { forceWarp = false } = {}) {
       extraDevices: extraDevices || 0,
       extraEdges: extraEdges || 0,
       cc: cc || DEFAULT_CC,
-      ccLabel: ccLabel || ""
+      ccLabel: ccLabel || "",
+      warpPlus: !!warpPlus
     },
     protonExpiresAt: proton ? proton.expiresAt : null,
     wind: wind ? { userId: wind.account.userId, servers: wn || 0 } : null,
@@ -2891,6 +2922,7 @@ var index_default = {
       }
       const report = { at: (/* @__PURE__ */ new Date()).toISOString(), items };
       await env.KV.put(K_DIAG, JSON.stringify(report));
+      const licBefore = await env.KV.get(K_LIC, "json");
       const main = items.find((x) => x.role === "\u514D\u8D39 WARP\uFF08\u4E3B\u529B\uFF09" && x.warpPlus !== null);
       if (main) {
         await env.KV.put(K_LIC, JSON.stringify({
@@ -2898,19 +2930,32 @@ var index_default = {
           warpPlus: main.warpPlus,
           premiumData: main.premiumData,
           quota: main.quota,
-          license: main.license || "",
+          // 体检问的是 CF，不看本地记录，所以授权码前 4 位要从上次的
+          // 记录里继承下来 —— 否则体检一次就把管理页那个「AAAA…」擦掉。
+          license: licBefore && licBefore.license || main.license || "",
           deviceId: main.deviceId || ""
         }));
+      }
+      const plusBefore = !!(licBefore && licBefore.warpPlus);
+      const plusAfter = !!(main && main.warpPlus);
+      let renamed = false;
+      if (plusBefore !== plusAfter) {
+        try {
+          await rebuild(env);
+          renamed = true;
+        } catch (e) {
+        }
       }
       const meta = await env.KV.get(K_STATE, "json") || {};
       meta.diag = report;
       await env.KV.put(K_STATE, JSON.stringify(meta));
       const dead = items.filter((x) => x.ok === false);
       const unknown = items.filter((x) => x.ok === null);
+      const renameNote = renamed ? plusAfter ? " \u53E6\u5916\uFF1A\u8FD9\u53F0\u8D26\u53F7\u5DF2\u7ECF\u662F WARP+ \u4E86\uFF0C\u514D\u8D39\u8FB9\u7F18\u90A3\u4E00\u65CF\u8282\u70B9\u540D\u5DF2\u5168\u90E8\u52A0\u4E0A \u300CW+ \u300D\u524D\u7F00\uFF08\u6574\u65CF\u90FD\u8D70 Argo\uFF09\u2014\u2014 \u5BA2\u6237\u7AEF\u91CD\u65B0\u5BFC\u5165\u4E00\u6B21\u8BA2\u9605\u5C31\u80FD\u770B\u5230\u3002" : " \u53E6\u5916\uFF1A\u8FD9\u53F0\u8D26\u53F7\u5DF2\u4E0D\u518D\u662F WARP+\uFF0C\u8282\u70B9\u540D\u7684\u300CW+ \u300D\u524D\u7F00\u5DF2\u53BB\u6389\uFF0C\u91CD\u65B0\u5BFC\u5165\u4E00\u6B21\u8BA2\u9605\u751F\u6548\u3002" : "";
       return json({
         ok: true,
         report,
-        msg: dead.length ? `${dead.map((d) => d.role).join("\u3001")} \u5DF2\u88AB CF \u5220\u9664\u6216\u540A\u9500 \u2014\u2014 \u8FD9\u5C31\u662F\u6574\u65CF\u8282\u70B9\u5168\u6B7B\u7684\u539F\u56E0\u3002\u514D\u8D39\u90A3\u51E0\u53F0\u53EF\u4EE5\u70B9\u300C\u4E00\u952E\u4FEE\u590D\u300D\u81EA\u52A8\u6362\u65B0\uFF1BZero Trust \u90A3\u4EFD\u8981\u56DE\u4E0B\u9762\u7C98\u4E00\u4EFD\u65B0 JWT\u3002` : `\u8BBE\u5907\u90FD\u6B63\u5E38${unknown.length ? `\uFF08${unknown.length} \u53F0\u6CA1\u6CD5\u6821\u9A8C\uFF0C\u89C1\u4E0B\u8868\uFF09` : ""}\u3002\u5982\u679C\u5BA2\u6237\u7AEF\u91CC\u8FD8\u662F\u6709\u8282\u70B9\u8FDE\u4E0D\u4E0A\uFF0C\u90A3\u5C31\u662F\u94FE\u8DEF/\u7AEF\u53E3\u5C42\u9762\u7684\u95EE\u9898\uFF0C\u4E0D\u662F\u8BBE\u5907\u51ED\u636E\uFF1A\u6362\u4E2A\u7AEF\u53E3\uFF084443 / 8443 / 8095\uFF09\u6216\u7528 ZT \u65CF\u8BD5\u3002`
+        msg: (dead.length ? `${dead.map((d) => d.role).join("\u3001")} \u5DF2\u88AB CF \u5220\u9664\u6216\u540A\u9500 \u2014\u2014 \u8FD9\u5C31\u662F\u6574\u65CF\u8282\u70B9\u5168\u6B7B\u7684\u539F\u56E0\u3002\u514D\u8D39\u90A3\u51E0\u53F0\u53EF\u4EE5\u70B9\u300C\u4E00\u952E\u4FEE\u590D\u300D\u81EA\u52A8\u6362\u65B0\uFF1BZero Trust \u90A3\u4EFD\u8981\u56DE\u4E0B\u9762\u7C98\u4E00\u4EFD\u65B0 JWT\u3002` : `\u8BBE\u5907\u90FD\u6B63\u5E38${unknown.length ? `\uFF08${unknown.length} \u53F0\u6CA1\u6CD5\u6821\u9A8C\uFF0C\u89C1\u4E0B\u8868\uFF09` : ""}\u3002\u5982\u679C\u5BA2\u6237\u7AEF\u91CC\u8FD8\u662F\u6709\u8282\u70B9\u8FDE\u4E0D\u4E0A\uFF0C\u90A3\u5C31\u662F\u94FE\u8DEF/\u7AEF\u53E3\u5C42\u9762\u7684\u95EE\u9898\uFF0C\u4E0D\u662F\u8BBE\u5907\u51ED\u636E\uFF1A\u6362\u4E2A\u7AEF\u53E3\uFF084443 / 8443 / 8095\uFF09\u6216\u7528 ZT \u65CF\u8BD5\u3002`) + renameNote
       });
     }
     if (path === "/api/cc" && req.method === "POST") {

@@ -165,10 +165,17 @@ async function rebuild(env, { forceWarp = false } = {}) {
   const extras = await getExtraWarps(env);
   // 拥塞控制档位存在 settings 里，改档位走 /api/cc 然后重建
   const settings = await getSettings(env);
+  // WARP+ 状态决定免费边缘那一族的节点名带不带 "W+ " 前缀。这个前缀是
+  // 给用户看的 —— 授权码是**账号属性**，不是一个单独的节点，用户问过
+  // 「怎么在客户端选 WARP+ 的节点」，答案是没得选、整族都是；有了前缀
+  // 才能在客户端里一眼确认「确实绑上了」。
+  // 读不到（没体检过 / KV 里没记录）就当没绑，节点名保持原样。
+  const licRec = await env.KV.get(K_LIC, "json");
   const { yaml, entries, landings, combos, proton: pn, wind: wn,
           zeroTrust: ztFlag, teamEdges, freeEdges,
-          extraDevices, extraEdges, cc, ccLabel } =
-    buildConfig(warp, opera, proton, wind, ztDev, extras, { cc: settings.cc });
+          extraDevices, extraEdges, cc, ccLabel, warpPlus } =
+    buildConfig(warp, opera, proton, wind, ztDev, extras,
+                { cc: settings.cc, warpPlus: !!(licRec && licRec.warpPlus) });
 
   const now = Date.now();
   const devInfo = (d) => d ? {
@@ -186,7 +193,8 @@ async function rebuild(env, { forceWarp = false } = {}) {
     stats: { entries, landings, combos, proton: pn || 0, wind: wn || 0,
              teamEdges: teamEdges || 0, freeEdges: freeEdges || 0,
              extraDevices: extraDevices || 0, extraEdges: extraEdges || 0,
-             cc: cc || DEFAULT_CC, ccLabel: ccLabel || "" },
+             cc: cc || DEFAULT_CC, ccLabel: ccLabel || "",
+             warpPlus: !!warpPlus },
     protonExpiresAt: proton ? proton.expiresAt : null,
     wind: wind ? { userId: wind.account.userId, servers: wn || 0 } : null,
     windErr,
@@ -584,6 +592,13 @@ export default {
 
       const report = { at: new Date().toISOString(), items };
       await env.KV.put(K_DIAG, JSON.stringify(report));
+      // 体检是唯一会主动去 CF 问「这台账号到底是不是 WARP+」的地方。
+      // 用户很可能是先在 1.1.1.1 App 里把码绑上、再回这里点体检 ——
+      // 那种情况下节点名的 "W+ " 前缀还没加上去（rebuild 读的是上次
+      // 落盘的 K_LIC）。所以这里比一下前后，变了就重建一次。
+      // **只在变了的时候**重建：体检问的是「设备还在不在」，一天点十次
+      // 不该触发十次重建（重建要重新拉 Opera 凭据，代价不小）。
+      const licBefore = await env.KV.get(K_LIC, "json");
 
       // 主力那台的账号状态单独存一份：管理页的 WARP+ 区块直接读它，
       // 不用每次开页面都去打一次 CF。
@@ -592,8 +607,21 @@ export default {
         await env.KV.put(K_LIC, JSON.stringify({
           at: report.at, warpPlus: main.warpPlus,
           premiumData: main.premiumData, quota: main.quota,
-          license: main.license || "", deviceId: main.deviceId || "",
+          // 体检问的是 CF，不看本地记录，所以授权码前 4 位要从上次的
+          // 记录里继承下来 —— 否则体检一次就把管理页那个「AAAA…」擦掉。
+          license: (licBefore && licBefore.license) || main.license || "",
+          deviceId: main.deviceId || "",
         }));
+      }
+
+      // WARP+ 状态翻转 -> 免费边缘整族节点名要加/去 "W+ " 前缀。
+      // 名字是生成期产物，不重建客户端看不到，用户会以为绑定失败。
+      const plusBefore = !!(licBefore && licBefore.warpPlus);
+      const plusAfter = !!(main && main.warpPlus);
+      let renamed = false;
+      if (plusBefore !== plusAfter) {
+        try { await rebuild(env); renamed = true; }
+        catch (e) { /* 重建失败不影响体检结论，把话说清楚就行 */ }
       }
       // 顺手并进 state：体检本身不重建配置（重建要重新拉 Opera 凭据，
       // 代价大且没必要），但管理页读的是 K_STATE，不写进去刷新后看不到。
@@ -605,15 +633,23 @@ export default {
 
       const dead = items.filter((x) => x.ok === false);
       const unknown = items.filter((x) => x.ok === null);
+      // 状态翻转时把「节点名变了、要重新导入」讲明白，不然用户回客户端
+      // 发现节点名多了一截，只会以为配置被改坏了。
+      const renameNote = renamed
+        ? (plusAfter
+            ? " 另外：这台账号已经是 WARP+ 了，免费边缘那一族节点名已全部加上 " +
+              "「W+ 」前缀（整族都走 Argo）—— 客户端重新导入一次订阅就能看到。"
+            : " 另外：这台账号已不再是 WARP+，节点名的「W+ 」前缀已去掉，重新导入一次订阅生效。")
+        : "";
       return json({
         ok: true, report,
-        msg: dead.length
+        msg: (dead.length
           ? `${dead.map((d) => d.role).join("、")} 已被 CF 删除或吊销 —— ` +
             "这就是整族节点全死的原因。免费那几台可以点「一键修复」自动换新；" +
             "Zero Trust 那份要回下面粘一份新 JWT。"
           : `设备都正常${unknown.length ? `（${unknown.length} 台没法校验，见下表）` : ""}。` +
             "如果客户端里还是有节点连不上，那就是链路/端口层面的问题，" +
-            "不是设备凭据：换个端口（4443 / 8443 / 8095）或用 ZT 族试。",
+            "不是设备凭据：换个端口（4443 / 8443 / 8095）或用 ZT 族试。") + renameNote,
       });
     }
 

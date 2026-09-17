@@ -727,5 +727,87 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   }
 }
 
+// ---- WARP+ 标记：节点名的 "W+ " 前缀 ----
+//
+// 背景：WARP+ 是**账号属性**，不是一个单独的节点 —— 绑上授权码之后免费边缘
+// 那一族整族改走 CF 的 Argo 优质骨干。客户端里原本没有任何视觉线索，用户
+// 会一直找「WARP+ 那一组」，线上被这么问过。所以主力那族的节点名统一加
+// "W+ " 前缀，绑上就能看见、绑不上就看不见。
+//
+// 这里守住四件事：
+//   1. 默认（没绑）名字一个都不改 —— 老订阅、老配置的行为必须完全不变；
+//   2. 绑上后**整族**都带前缀，包括「官方域名」那个节点；
+//   3. 备胎（另一台账号）和 ZT（团队密钥）**不带** —— 授权码不覆盖它们，
+//      给它们加前缀等于骗用户「备胎也走 Argo」；
+//   4. 前缀不能影响测速池大小 —— 手机上并发握手次数是硬预算。
+{
+  const namesOf = (y) => [...y.matchAll(/^  - name: (.+)\n    type: masque$/gm)]
+    .map((m) => m[1]);
+  const nb = (y, n) => {
+    const i = y.indexOf(`  - name: ${n}\n`);
+    return i < 0 ? "" : y.slice(i, y.indexOf("\n  - name:", i + 10));
+  };
+  const pool = (y) => {
+    const i = y.indexOf("  - name: ♻️ 自动选择\n");
+    const seg = y.slice(i, y.indexOf("\n  - name:", i + 10));
+    return [...seg.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
+  };
+
+  const plus = buildConfig(warp, opera, null, null, null, [], { warpPlus: true });
+  const off = buildConfig(warp, opera, null, null, null, [], { warpPlus: false });
+  const dflt = buildConfig(warp, opera, null, null, null, []);
+
+  t("warpPlus:true 时统计里 warpPlus 为 true", plus.warpPlus === true);
+  t("warpPlus:false 时统计里 warpPlus 为 false", off.warpPlus === false);
+  t("默认不传时 warpPlus 为 false", dflt.warpPlus === false);
+  t("默认时节点名里一个 W+ 都没有（老行为不变）", !off.yaml.includes("W+"));
+  t("默认时接入点仍是 57 个", off.entries === 57);
+
+  const pn = namesOf(plus.yaml);
+  t("免费边缘整族带 W+ 前缀（IPv4 和 IPv6 都带）",
+    pn.includes("W+ 198.1-443") && pn.includes("W+ v6-103-1-443"));
+  t("「官方域名」节点也带前缀", pn.includes("W+ 官方域名"));
+  t(`WARP+ 时接入点还是 57 个（只改名，不加节点）`, plus.entries === 57);
+  t(`带 W+ 的节点正好 ${plus.freeEdges} 个（= 免费边缘全族）`,
+    pn.filter((n) => n.startsWith("W+ ")).length === plus.freeEdges);
+  t("W+ 节点用的还是同一把消费版密钥",
+    nb(plus.yaml, "W+ 198.1-443").includes(`private-key: ${warp.privateKey}`));
+  t("W+ 节点仍不写 sni（沿用内核默认的消费版 SNI）",
+    !nb(plus.yaml, "W+ 198.1-443").includes("cloudflareclient.com"));
+  t("W+ 官方域名节点用的是消费版 SNI",
+    nb(plus.yaml, "W+ 官方域名").includes("consumer-masque.cloudflareclient.com"));
+  t("WARP直连 组的成员名跟着改，不留悬空引用",
+    /- "W\+ 198\.1-443"/.test(plus.yaml) && !/- "198\.1-443"/.test(plus.yaml));
+  t("头部注释里说清了 W+ 前缀的含义", plus.yaml.includes("W+ 开头的是"));
+  t("没绑时头部不出现那段说明", !off.yaml.includes("W+ 开头的是"));
+
+  // 备胎是另一台账号、另一把密钥。一个授权码同一时间只能绑一个账号，
+  // 所以它**不在** Argo 上 —— 绝不能给它加 W+。
+  const alt = { privateKey: "ALT1_PRIV", peerPublicKey: "ALT1_PUB",
+                ipv4: "172.16.1.2", ipv6: "2606:4700:110:1::2", deviceId: "alt" };
+  const withAlt = buildConfig(warp, opera, null, null, null, [alt], { warpPlus: true });
+  const an = namesOf(withAlt.yaml);
+  t("备胎节点名不带 W+（它是另一台账号，码不覆盖它）",
+    an.includes("W2-198.1-443") && !an.some((n) => n.startsWith("W+ W2-")));
+  t("备胎仍用自己那把密钥",
+    nb(withAlt.yaml, "W2-198.1-443").includes("ALT1_PRIV"));
+
+  // ZT 是团队设备：团队密钥 + 团队 SNI，消费版授权码绑不上去
+  const ztDev = { privateKey: "ZT_PRIV", peerPublicKey: "ZT_PUB",
+                  ipv4: "172.16.2.2", ipv6: "2606:4700:110:2::2",
+                  deviceId: "zt", zeroTrust: true };
+  const withZt = buildConfig(warp, opera, null, null, ztDev, [], { warpPlus: true });
+  const zn = namesOf(withZt.yaml);
+  t("ZT 节点不带 W+（团队密钥不吃消费版授权码）",
+    zn.includes("ZT-197.1-443") && !zn.some((n) => n.startsWith("W+ ZT-")));
+  t("ZT 节点数不受影响", zn.filter((n) => n.startsWith("ZT-")).length === 14);
+
+  // 前缀不能把测速预算撑大 —— 手机上并发握手次数卡得很死
+  t("W+ 不改变自动测速池大小（手机测速预算不涨）",
+    pool(plus.yaml).length === pool(off.yaml).length);
+  t("自动选择池子里确实有 W+ 节点（前缀不影响按端口过滤）",
+    pool(plus.yaml).includes("W+ 198.1-443"));
+}
+
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);

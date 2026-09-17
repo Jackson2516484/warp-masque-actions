@@ -157,15 +157,24 @@ function masqueNode(name, ip, port, priv, pub, v4, v6, sni, cc = "") {
  *
  * slot 是**第几台免费设备**（1 起）：
  *   slot 1 出全集（4 个 IPv4 + 4 个 IPv6 x 7 端口 = 57 个），是主力；
- *   slot>=2 只出精选端口 x IPv4（16 个），节点名带 W2-/W3- 前缀。
+ *   slot>=2 只出精选端口 x IPv4（16 个），节点名带 W2-/W3- 前缀；
+ *   plus=true 时 slot 1 那族每个节点名前面加 "W+ "（见下面 tag 的注释）。
  * 备胎不需要那么宽的回退面，但要能被「♻️ 自动选择」测到 —— 主力那台
  * 被 CF 清掉时，备胎是同一族里唯一还活着的节点。 */
-function buildEntries(dev, { slot = 1, cc = "" } = {}) {
+function buildEntries(dev, { slot = 1, cc = "", plus = false } = {}) {
   const { privateKey: priv, peerPublicKey: pub, ipv4: v4, ipv6: v6, zeroTrust } = dev;
   // v4Entries 单独留一份：做 dialer-proxy 目标时只能用 IPv4，
   // 否则纯 IPv4 的机器上会直接 "network is unreachable"。
   const entries = [], v4Entries = [], proxies = [];
-  const tag = slot > 1 ? `W${slot}-` : "";
+  // 主力那族绑上 WARP+ 授权码时，整族节点名前面挂一个 "W+ " 标记。
+  //
+  // 这个标记是给用户看的：WARP+ 是**账号属性**，不是一个单独的节点 ——
+  // 绑成功后免费边缘那 57 个节点**全部**改走 Argo，客户端里没有一份
+  // 「WARP+ 节点」可以挑。不给标记的话，用户看到管理页写着「WARP+ 已启用」
+  // 却在客户端里找不到任何 WARP+ 字样，只会以为没生效。
+  // 标记顺便还把「备胎（W2-/W3-）」和主力区分开：备胎是另一台账号，
+  // 那个授权码**不覆盖**它们。
+  const tag = slot > 1 ? `W${slot}-` : (plus ? "W+ " : "");
 
   // 团队边缘。节点名带 "ZT-" 前缀，客户端里一眼能分清是哪一族。
   if (zeroTrust) {
@@ -196,9 +205,11 @@ function buildEntries(dev, { slot = 1, cc = "" } = {}) {
   // 官方域名只给主力那份出。它是「用户能一眼看懂」的兜底节点，
   // 备胎不需要。SNI 必须是消费版的（以前误用了团队版的，恒死）。
   if (slot === 1) {
-    entries.push("官方域名");
-    v4Entries.push("官方域名");   // 官方域名节点本身连的是 IPv4
-    proxies.push(masqueNode("官方域名", SNI_NODE[0], SNI_NODE[1],
+    // 这个名字也走 tag：WARP+ 生效时它是 "W+ 官方域名"，跟同族保持一致
+    const offName = tag + "官方域名";
+    entries.push(offName);
+    v4Entries.push(offName);   // 官方域名节点本身连的是 IPv4
+    proxies.push(masqueNode(offName, SNI_NODE[0], SNI_NODE[1],
                             priv, pub, v4, v6, CONSUMER_SNI, cc));
   }
   return { entries, proxies, v4Entries, teamEntries: [], teamProxies: [] };
@@ -601,7 +612,12 @@ export function buildConfig(warp, opera, proton, wind, ztDevice = null, extraWar
   const ccPreset = CC_PRESETS[ccKey];
   const ccExtra = ccLines(ccPreset);
 
-  const free = freeDev ? buildEntries(freeDev, { slot: 1, cc: ccExtra }) : null;
+  // WARP+ 授权码生效时，免费边缘那一族整族节点名加 "W+ " 前缀。
+  // 只加在主力那族上：备胎是**另一台账号**，授权码不覆盖它们；
+  // ZT 是团队线路，走的是团队密钥 + 团队 SNI，本来也不吃授权码。
+  const plus = opts.warpPlus === true;
+
+  const free = freeDev ? buildEntries(freeDev, { slot: 1, cc: ccExtra, plus }) : null;
   const zteam = ztDev ? buildEntries(ztDev, { cc: ccExtra }) : null;
 
   // 备用免费设备（备胎）。每台是**另一个免费账号、另一把密钥** ——
@@ -894,7 +910,10 @@ ${zt ? `#   ZT团队边缘         本机 -> MASQUE(团队边缘 197.x) -> 目�
 # ZT- 开头的是 Zero Trust 团队边缘节点（162.159.197.x）。
 # W2- / W3- 开头的是**备用免费设备**的接入点（另一把密钥、另一个账号，
 # 只出 443 / 8095 两个端口 —— 它们是主力设备的备胎，不是主力）。
-#
+${plus ? `# W+ 开头的是**已绑 WARP+ 授权码**的节点：免费边缘那一族整族走 CF 的
+#    Argo 优质骨干。授权码是账号属性，客户端里没有单独的「WARP+ 分组」
+#    可选 —— 这一族的每个节点都是 WARP+。备胎（W2-/W3-）不在里面。
+` : ""}#
 # 接入点共 ${frontAll.length} 个（免费边缘 ${freeEntries.length}${extraEntries.length ? ` + 备用免费 ${extraEntries.length}` : ""} + ZT 团队边缘 ${teamEntries.length}）
 # x 落地 ${opera.landings.length} 个 = 组合 ${combos} 个${protonNames.length ? `，外加 ${protonNames.length} 个 Proton 落地` : ""}${windNames.length ? ` 和 ${windNames.length} 个 Windscribe 落地` : ""}。
 # 任一环失效都有替代路径；某个族整体不可用时，另外两族照常工作。
@@ -1080,6 +1099,8 @@ ${rules}
            zeroTrust: zt, teamEdges: teamEntries.length,
            // 当前拥塞控制档位。UI 要显示它，也是排查「为什么还是慢」的第一手信息
            cc: ccKey, ccLabel: ccPreset.label,
+           // WARP+ 是否已生效（决定节点名有没有 "W+ " 前缀）。UI 要显示它。
+           warpPlus: plus,
            freeEdges: freeEntries.length,
            // 备用免费设备：台数 + 它们的节点数。UI 要靠这两个数跟用户说清楚
            // 「免费族有几台设备在扛」，也是排查「一族全死」时的第一手信息。

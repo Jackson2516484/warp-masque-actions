@@ -197,6 +197,22 @@ const dev = (id, ip, extra = {}) => ({
     t("没生效时仍显示输入框", h.includes('id="lic"'));
     t("没生效时仍能点「换新设备再绑定」", h.includes("bindLic(true)"));
     t("没生效时不显示 WARP+ 已启用", !h.includes("WARP+ 已启用"));
+
+    // ---- 「客户端里怎么选 WARP+ 节点」----
+    // 线上真的被这么问过（用户看着管理页写着「WARP+ 已启用」，回客户端里
+    // 找不到任何 WARP+ 字样）。根因：WARP+ 是**账号属性**，不会另长出一份
+    // 节点。UI 必须主动把这件事讲清楚，否则用户会一直找「WARP+ 那一组」。
+    {
+      const h = render({ ...withStats(),
+        license: { at: iso(now), warpPlus: true, premiumData: 5 * 1073741824 } });
+      t("正面回答「怎么选」：没得选、整族都是", h.includes("没得选，整族都是"));
+      t("说清 W+ 是节点名前缀", h.includes("W+&nbsp;"));
+      t("说清哪些节点不带 W+（备胎 / ZT）", h.includes("哪些节点不带 W+"));
+      t("节点区块也说明 W+ 标记的含义",
+        h.includes("看到这个标记就说明授权码"));
+      t("不再说 ZT 团队边缘也吃消费版授权码",
+        !h.includes("ZT 团队边缘都吃这个账号"));
+    }
   }
 
   // ---- 节点区块那条「别钉死单个节点」的提示 ----
