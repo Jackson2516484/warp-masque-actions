@@ -85,6 +85,43 @@ function ccLines(preset) {
          (preset.profile ? `\n    bbr-profile: ${preset.profile}` : "");
 }
 
+// ── 健康检查探测点：分「宽松」「严格」两档，全部走 HTTPS ──────────────
+//
+// 这是「刚开始能用、过几天不能用，而且再也不恢复」的核心机制。
+//
+// 内核判定一个节点活不活，只看这一行（adapter/adapter.go，URLTest）：
+//
+//     satisfied = resp != nil && (expectedStatus == nil || expectedStatus.Check(code))
+//
+// 翻成人话：**不写 expected-status 时，任何 HTTP 响应都算「活」** ——
+// 包括 403 / 429 / 302。只有网络层错误（超时、连接被拒）才判死。
+//
+// 于是用 gstatic 当探测点就会出现这个局面：出口 IP 已经被目标站拉黑
+// （YouTube 403、Netflix 判成机房），但 gstatic 照样回 204 —— 组里所有
+// 节点全绿，自动选择**永远不会换手**。用户看到的就是「前几天好好的，
+// 忽然不能用了，而且一直不恢复」。
+//
+// 本机实测（国内直连，被墙环境下）：
+//   https://www.gstatic.com/generate_204   -> 204   被墙也能通，最宽松
+//   https://www.google.com/generate_204    -> 超时  真正区分「能不能上外网」
+//   https://www.youtube.com/generate_204   -> 超时
+// gstatic 是 Google 的静态资源 CDN，为了可用性几乎不拦 IP —— 所以它能
+// 证明「这条隧道通」，但证明不了「这个出口被目标站接受」。google.com 才是
+// 那个有效信号。
+//
+// 宽松档：速度优先的组（♻️ 自动选择 / WARP直连 / 聚合 / 地域线路）。
+//   宁可把慢的当活的，也绝不把好节点误判成死的 —— 误判会让整组掉到
+//   成员列表的第一个上，那是比「慢」严重得多的事故。
+// 严格档：出口本身就是卖点的组（流媒体 / Proton / Windscribe 落地）。
+//   这些组里「换到一个目标站接受的出口」远比「延迟低 20ms」重要。
+const TEST_REACH = "https://www.gstatic.com/generate_204";
+const TEST_STRICT = "https://www.google.com/generate_204";
+// 必须加引号。GroupCommonOption.ExpectedStatus 的 Go 类型是 string
+// （adapter/outboundgroup/parser.go），内核解码器虽然开了 WeaklyTypedInput，
+// 但不去赌「整数 204 能不能被弱转成字符串」—— 解析失败会让**整份配置
+// 加载不了**，这个代价和收益完全不成比例。
+const EXPECT_204 = '    expected-status: "204"';
+
 const RS = "https://raw.githubusercontent.com";
 const RULESETS = [
   ["🎯 全球直连", RS + "/cmliu/ACL4SSR/refs/heads/main/Clash/CFnat.list"],
@@ -278,8 +315,20 @@ const PLAY_DOMAINS = [
   "play.google.com", "play.googleapis.com", "android.clients.google.com",
   "dl.google.com", "dl-ssl.google.com",
   "gvt1.com", "gvt2.com", "gvt3.com",
-  "ggpht.com", "googleusercontent.com",
+  // ggpht.com 故意**不在这里**。它同时是 YouTube 的缩略图主机
+  // （yt3.ggpht.com）。写在这里会让它被本组规则抢先命中，于是
+  // YouTube 的缩略图走一个出口、视频走另一个出口 —— 违反下面那条
+  // 「一个服务族同出口」。它已经在 STREAM_DOMAINS 里，归 🎬 流媒体。
+  "googleusercontent.com",
 ];
+
+// ⚠️ 不变量：STREAM_DOMAINS 与 PLAY_DOMAINS 不能有交集。
+//
+// 两个列表发出的规则位置不同（PLAY 在前），所以一旦同一个域名同时出现在
+// 两处，PLAY 那一份会赢，那个域名的其余同族主机就漂到别的组去了 ——
+// ggpht.com 就是这么把 yt3.ggpht.com 从 YouTube 族里拆出去的。
+// 想验证有没有再犯：config.test.mjs 里有 `PLAY ∩ STREAM 无交集` 和
+// `yt3.ggpht.com 不再漂到 🌐 落地出口` 两条断言。
 
 // 维基媒体。国内直连解析会被污染，必须走代理 + 境外 DNS 一起上。
 const WIKI_DOMAINS = [
@@ -299,16 +348,34 @@ const ADULT_DOMAINS = [
 // 流媒体 / 测速 / 大文件下载 —— 这些是「跑满带宽」的流量，也是唯一会把
 // 单条 MASQUE 隧道（UDP）压到先被 QoS 打击的那条流。单独拆出来，是为了
 // 能把它们和普通网页分开拨到不同的接入点上（见 🎬 流媒体 组）。
+// 第一原则：**一个服务族的所有主机必须落在同一个组里。**
+//
+// 为什么这是第一原则：视频站取「播放清单」和取「视频分片」是两个不同的
+// 域名。YouTube 的清单来自 youtubei.googleapis.com，分片来自
+// googlevideo.com。如果前者被上游规则集判给了别的组，两条流就会走
+// **不同的出口 IP**，而 googlevideo 的播放地址是**按请求方 IP 签名**的 ——
+// 换个 IP 去取分片，直接 403。
+//
+// 表现就是「页面能打开、视频一直转圈」，而且**时好时坏**：取决于那两个组
+// 当时是不是恰好选中了同一个节点。这正是「前几天能用、过几天不能用」。
+//
+// 所以：宁可把整族一起拽进来，也不留一个主机在外面漂。
 const STREAM_DOMAINS = [
-  // 油管 / 奈飞 / 迪士尼 / 亚马逊 / HBO
-  "googlevideo.com", "youtube.com", "youtu.be", "ytimg.com", "ggpht.com",
-  "netflix.com", "nflxvideo.net", "nflximg.net", "nflxso.net",
-  "disneyplus.com", "dssott.com", "bamgrid.com",
-  "primevideo.com", "aiv-cdn.net", "aiv-delivery.net",
+  // 油管。youtubei.* 是播放器的 API 主机（清单 / 字幕 / 推荐全走它），
+  // youtube-nocookie 是站外嵌入播放器走的那条 —— 这两个是历史上最常被
+  // 漏掉的，一漏就是「能开页面但永远不播」。
+  "youtube.com", "youtu.be", "yt.be", "googlevideo.com", "ytimg.com", "ggpht.com",
+  "youtubei.googleapis.com", "youtube-nocookie.com", "youtubekids.com",
+  // 奈飞 / 迪士尼 / 亚马逊 / HBO
+  "netflix.com", "nflxvideo.net", "nflximg.net", "nflxso.net", "nflxext.com",
+  "disneyplus.com", "dssott.com", "bamgrid.com", "disneystreaming.com",
+  "primevideo.com", "amazonvideo.com", "aiv-cdn.net", "aiv-delivery.net",
   "hbomax.com", "max.com",
   // 音乐 / 直播 / 短视频
-  "spotify.com", "scdn.co", "twitch.tv", "ttvnw.net", "vimeo.com",
-  "vimeocdn.com", "tiktokcdn.com", "tiktokcdn-us.com", "ibytedtos.com",
+  "spotify.com", "scdn.co", "spotifycdn.com", "spotifycdn.net",
+  "twitch.tv", "ttvnw.net", "vimeo.com", "vimeocdn.com",
+  "tiktok.com", "tiktokv.com", "tiktokcdn.com", "tiktokcdn-us.com",
+  "muscdn.com", "ibytedtos.com", "ibyteimg.com", "byteoversea.com",
   // 测速站点（Fast/Speedtest 是最好用的「隧道真实吞吐」量尺）
   "fast.com", "speedtest.net",
 ];
@@ -322,6 +389,17 @@ const SENSITIVE_ROUTES = [
 
 const q = (a, n = 6) => a.map((x) => " ".repeat(n) + `- "${x}"`).join("\n");
 const p = (a, n = 6) => a.map((x) => " ".repeat(n) + `- ${x}`).join("\n");
+
+/** 把一组域名渲染成 nameserver-policy 条目（单行流式列表，省行数）。
+ *
+ * 为什么要显式钉，而不是交给 geosite:geolocation-!cn：
+ * 那条策略依赖地理库（geodata）。地理库没下载成功或者过期时，这条策略
+ * **静默失效**，直接回落到下面的 nameserver = 国内 DoH。又是一类
+ * 「先能用、过几天不能用」。逐个钉死就把这个隐式依赖去掉了。
+ */
+function dnsPin(list) {
+  return list.map((d) => `    '+.${d}': [https://1.1.1.1/dns-query, https://8.8.8.8/dns-query]`).join("\n");
+}
 
 /** 两个池子交错合并：[a0, b0, a1, b1, ...]。
  *
@@ -490,7 +568,8 @@ dns:
       - https://8.8.8.8/dns-query
     '+.claude.ai':
       - https://1.1.1.1/dns-query
-      - https://8.8.8.8/dns-query`;
+      - https://8.8.8.8/dns-query
+${dnsPin(STREAM_DOMAINS)}`;
 }
 
 /** 下游分组（油管/奈飞/OpenAI 那些），两种配置共用。
@@ -722,7 +801,7 @@ export function buildConfig(warp, opera, proton, wind, ztDevice = null, extraWar
   const windLocDefs = Object.entries(windByLoc).map(([loc, names]) =>
     `  - name: WS-${loc}
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 300
     tolerance: 100
     lazy: true
@@ -738,7 +817,7 @@ ${q(names)}`).join("\n\n");
   const protonCCDefs = Object.entries(protonByCC).map(([cc, names]) =>
     `  - name: Proton-${cc}
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 300
     tolerance: 100
     lazy: true
@@ -802,7 +881,7 @@ ${q(names)}`).join("\n\n");
 
   const locDefs = Object.entries(byLoc).map(([loc, tags]) => `  - name: ${loc}线路
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 300
     tolerance: 80
     lazy: true
@@ -816,7 +895,7 @@ ${q(tags)}`).join("\n\n");
   const ztGroupDef = zt ? `
   - name: ZT团队边缘
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 90
     tolerance: 15
     timeout: 2500
@@ -833,7 +912,7 @@ ${q(teamEntries)}
   - name: ⚡ 聚合ZT
     type: load-balance
     strategy: consistent-hashing
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 300
     tolerance: 40
     proxies:
@@ -843,7 +922,7 @@ ${q(ztAggPool)}
   - name: ⚡ 聚合WARP
     type: load-balance
     strategy: consistent-hashing
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 300
     tolerance: 40
     proxies:
@@ -863,7 +942,7 @@ ${q(freeAggPool)}
   const warpGroupDef = warpAll.length ? `
   - name: WARP直连
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 300
     tolerance: 40
     timeout: 3000
@@ -893,6 +972,45 @@ ${q(warpAll)}
     "      - 📹 油管视频",
     "      - DIRECT",
   ].filter(Boolean).join("\n") + "\n";
+
+  // 流媒体族的「自动降级链」。这是「让它一直能用」的最后一段。
+  //
+  // 为什么必须有它：🎬 流媒体自动 的池子里只有 WARP 三族（免费边缘 / ZT /
+  // 备胎），出口 IP **全是 Cloudflare 的共享段** —— 恰好就是最容易被
+  // Google 判成机房、拉黑的那一批。如果整族一起被判了，严格探测把它们
+  // 全标死之后，url-test 的选法是「退回成员列表的第一个」（urltest.go 的
+  // fast()：全员不合格时 fast = proxies[0]），而那个仍然是 CF 出口 ——
+  // 等于原地不动。探测再准也逃不出去。
+  //
+  // 这一组用 fallback：按成员顺序取**第一个活着**的（findAliveProxy），
+  // 所以它会一路降到 🌐 落地出口 —— Opera / Proton / Windscribe 的机房，
+  // 出口 IP 整批换掉。落到这一层，大部分「按机房 IP 拦截」的站点都能救回来。
+  // 再不行才 DIRECT（国内真实网络下 DIRECT 到 google.com 必然是死的，
+  // 严格探测会把它跳过，所以它实际上只在用户手选时才有意义）。
+  //
+  // 成员里**故意不放 load-balance 组（⚡ 聚合ZT / ⚡ 聚合WARP）**：
+  // 部分手机端内核对嵌套负载均衡支持不全，那个成员一失效整组就哑了 ——
+  // 用户抱怨过的「手机端 YouTube 一直转圈、电脑上却正常」就是它。
+  // 这里只需要「换一个出口族」，🌐 落地出口 已经覆盖了，
+  // 没必要为一个备用层级去冒手机端兼容性的风险。
+  //
+  // 用组当成员本身是安全的：fallback 只比「活不活」，不比延迟 ——
+  // 「嵌套组的延迟取子组旧值」那个坑只坑 url-test 比延迟的场景。
+  // 🔄 故障转移 早就是同样的结构（fallback 套一堆组）。
+  const streamFallbackDef = `
+  - name: 🛟 流媒体兜底
+    type: fallback
+    url: ${TEST_STRICT}
+${EXPECT_204}
+    interval: 300
+    timeout: 2500
+    max-failed-times: 2
+    lazy: false
+    proxies:
+      - 🎬 流媒体自动
+      - 🌐 落地出口
+      - DIRECT
+`;
 
   const { prov, rules } = buildRules();
 
@@ -930,6 +1048,28 @@ ${plus ? `# W+ 开头的是**已绑 WARP+ 授权码**的节点：免费边缘那
 #
 # 需要 mihomo Alpha 分支：稳定版没有 masque outbound，也不认 dialer-proxy。
 # private-key 等同 WARP 账号凭据，别外传。
+#
+# ── 「本来能用，过几天就不能用了」怎么排查 ────────────────────────────
+#
+# 先理解一件事：内核判定节点活不活，看的是探测点返回什么。本份用了两档：
+#   宽松 ${TEST_REACH}
+#       只要通就算活。实测在被墙的直连下都返回 204 —— 它证明不了
+#       「出口被目标站接受」。用在速度优先的组，绝不误判。
+#   严格 ${TEST_STRICT}
+#       配 expected-status: "204"。被目标站拒绝的出口（403/429/302）
+#       在这里露馅，组自动换手。🎬 流媒体自动 / Proton-自动 / WS-自动 用它。
+#
+# 所以「过几天不能用了」按这个顺序查（越靠前越可能）：
+#   1. 出口 IP 被目标站拉黑。这一条现在基本不用你管：
+#      🎬 流媒体 默认走 🛟 流媒体兜底，它会在整族 CF 出口都被判死时，
+#      自动降到 🌐 落地出口（Opera/Proton/Windscribe 的机房，整批换出口 IP）。
+#      最多 5 分钟一轮就会切过去。想手动钉某一条就进 🎬 流媒体 手选 —— 
+#      🌐 落地出口 是**粘**的，选定不换。
+#   2. 设备被 Cloudflare 删了。去管理页点「设备体检」，它会点名是哪一台。
+#   3. 整族链路不通。交叉换 ZT团队边缘 / WARP直连 / 备胎（W2- W3-）试。
+#   4. 只有某一个 App 不行。大概率是它的某个主机不在本份域名表里，漂到
+#      🐟 漏网之鱼去了。对照下面「节点」区块的数，把主机补进 STREAM_DOMAINS
+#      或 AI_DOMAINS。记住第一原则：一个服务的所有主机必须同组同出口。
 
 ${head(true)}
 
@@ -958,7 +1098,7 @@ ${p(landingPool)}
   - name: ⚡ 聚合
     type: load-balance
     strategy: consistent-hashing
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 300
     tolerance: 40
     proxies:
@@ -973,23 +1113,44 @@ ${ztAggDef}${freeAggDef}
   # YouTube 打不开 / 一直转圈时，往下切成下面接的落地组：
   # CF 自己的出口 IP 被 Google 判成机房而限流时，换个出口就好。
   # 选定后写进 profile.store-selected，重启不丢。
+${streamFallbackDef}
+  # 默认成员是 🛟 流媒体兜底（fallback），不是 🎬 流媒体自动。
+  # 差别就在「整族出口都被目标站判死」那一种情况：
+  #   自动组 → 退回同族的第一个 CF 出口，等于原地不动；
+  #   兜底组 → 一路降到 🌐 落地出口，换掉整批出口 IP，站点就活了。
+  # 下面那一长串手选成员保持原样，需要钉死某一个节点时照样能钉。
   - name: 🎬 流媒体
     type: select
     proxies:
-      - 🎬 流媒体自动
+      - 🛟 流媒体兜底
 ${streamExtra}${q(pickPool)}
 
-  # 流媒体自动选优。只测精选池（手机上也测得完），开机就绪。
+  # 流媒体自动选优。只测精选池（手机上也测的完），开机就绪。
   #
-  # interval 压到 90s、tolerance 收到 10ms：4K 是一整条持续几十 Mbps 的
-  # 单流，链路一抖就要立刻换，不能等三分钟。tolerance 小 = 只要新节点比
-  # 当前快 10ms 以上就切过去（url-test 的语义是「当前节点仍在前 tolerance
-  # 名内就不动」，越小越愿意换手）。
+  # 这一组的目标是**能用且不中途断**，不是「当前最快」。所以它是全份里
+  # 唯一一个「粘」的自动组，两个参数都是为了黏住出口：
+  #
+  # interval: 300 —— 5 分钟重测一轮。测的是 HEAD 且开了 unified-delay，
+  #   一轮成本是每节点两个 HTTP 头，数据量可忽略；QUIC 连接本身有 30s
+  #   keepalive，重测不用重新握手。所以拉长间隔省的不是流量，是**换手次数**。
+  # tolerance: 150 —— 这就是「粘」的开关。内核逻辑是：
+  #     if (当前节点比最快的慢 > tolerance) 才换
+  #   所以这个值越大越不愿意换。150 的意思是：只有当前出口比最优候选慢
+  #   150ms 以上才考虑动它。
+  #   ⚠️ 这里我上一版做反了（设成 90s / 10ms），理由是「4K 一抖就要换」。
+  #   那是错的：视频是一条长连接，换出口 = 播放清单里的分片 URL 作废
+  #   （googlevideo 的地址按请求方 IP 签名），换个 IP 去取就是 403。
+  #   频繁换手换来的是「时不时卡一下 / 播放失败」，而不是更流畅。
+  #   正确做法是**只在真的不合格时才换** —— 由下面的探测点负责判断。
+  #
+  # url 用严格档：出口被目标站拒绝（403/429/302）时判死，组自己换手。
+  # 这一条就是「让它一直能用」的执行部分：出问题不用你手动切。
   - name: 🎬 流媒体自动
     type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 90
-    tolerance: 10
+    url: ${TEST_STRICT}
+${EXPECT_204}
+    interval: 300
+    tolerance: 150
     timeout: 2500
     max-failed-times: 2
     lazy: false
@@ -1026,7 +1187,7 @@ ${p(picks)}
   # 注意：手动钉死某一个具体节点 = 关掉这套自动优选。要一直最快就用组。
   - name: ♻️ 自动选择
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 60
     tolerance: 10
     timeout: 2000
@@ -1037,7 +1198,7 @@ ${q(pickPool)}
 
   - name: 🔄 故障转移
     type: fallback
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_REACH}
     interval: 120
     timeout: 3000
     max-failed-times: 2
@@ -1054,9 +1215,12 @@ ${protonNames.length ? `
       - Proton-自动
 ${p(protonCCNames)}
 
+  # 落地族存在的意义就是「换一个目标站接受的出口」，所以它的自动选点
+  # 也用严格档：一个连 google.com 都过不去的出口，换过去没意义。
   - name: Proton-自动
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_STRICT}
+${EXPECT_204}
     interval: 300
     tolerance: 80
     lazy: true
@@ -1073,7 +1237,8 @@ ${p(windLocNames)}
 
   - name: WS-自动
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: ${TEST_STRICT}
+${EXPECT_204}
     interval: 300
     tolerance: 80
     lazy: true

@@ -234,5 +234,42 @@ const dev = (id, ip, extra = {}) => ({
   }
 }
 
+// ---- 「一直能用」区块：这段文案是给用户排查用的，掉了就等于没写 ----
+{
+  const st = {
+    ...base,
+    stats: { entries: 71, combos: 122, freeEdges: 57, teamEdges: 14,
+             landings: 12, proton: 10, wind: 13, extraDevices: 2, extraEdges: 16 },
+    warp: dev("aaaaaaaa-bbbb", "172.16.0.2"),
+    warpExtras: [],
+  };
+  const h = render(st);
+
+  t("有「一直能用」区块", h.includes("一直能用 · 三层自动恢复"));
+  // 三层各自的关键说法，少一层这个区块就不完整
+  t("讲清第一层：探测点分两档", h.includes("gstatic.com/generate_204") &&
+    h.includes("google.com/generate_204") && h.includes("expected-status"));
+  t("讲清「不写 expected-status 时任何响应都算活」",
+    h.includes("任何 HTTP 响应都算「活」") && h.includes("403 / 429 / 302"));
+  t("讲清第二层：流媒体族是粘的，且说明为什么",
+    h.includes("流媒体族是「粘」的") && h.includes("按请求方 IP 签名"));
+  t("讲清第三层：会自动换出口族",
+    h.includes("自动换出口族") && h.includes("流媒体兜底") &&
+    h.includes("落地出口"));
+  // 这条不变量正是 YouTube「页面能开、视频不播」的成因
+  t("讲清「一个服务的所有主机必须同组」",
+    h.includes("youtubei.googleapis.com") && h.includes("googlevideo.com"));
+  t("给了五步排查顺序", h.includes("还是不通时，按这个顺序查") &&
+    h.includes("先等 5 分钟"));
+  // 诚实边界：别让用户以为这能改带宽
+  t("说明了改不了的边界", h.includes("改不了的边界") &&
+    h.includes("pick_fastest.py"));
+
+  // 节点区块里那条「YouTube 打不开就切这个组」的旧说法必须已经更新，
+  // 否则用户会照着旧文案去切一个已经不存在的默认成员
+  t("流媒体组说明已指向兜底链", h.includes("🛟 流媒体兜底") &&
+    !h.includes("默认走「🎬 流媒体自动」"));
+}
+
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);

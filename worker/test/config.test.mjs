@@ -335,7 +335,9 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   // consumer WARP（不传 zeroTrust）绝不能冒出团队边缘。
   // 只看真正的节点定义（server: 162.159.197），不看注释里的说明文字。
   const consumer = buildConfig(warp, opera);
-  t("免费 WARP 不该有 ZT团队边缘 组", !consumer.yaml.includes("ZT团队边缘"));
+  // 按**组定义**匹配，不按子串 —— 头部注释里出现「ZT团队边缘」四个字
+  // 不算，用户看到的排查指引里本来就该提它。
+  t("免费 WARP 不该有 ZT团队边缘 组", !/^  - name: ZT团队边缘$/m.test(consumer.yaml));
   t("免费 WARP 不该有 197.x 节点定义",
     !/server: 162\.159\.197/.test(consumer.yaml));
   t("免费 WARP 标记 ZT 关", consumer.zeroTrust === false && consumer.teamEdges === 0);
@@ -451,12 +453,14 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   const streamMembers = [...stream.matchAll(/^      - "([^"]+)"$/gm)].map((m) => m[1]);
   t(`流媒体 ${streamMembers.length} 个成员都是真实接入点`,
     streamMembers.length > 0 && streamMembers.every((m) => entryNames.includes(m)));
-  // 默认出口必须是 url-test 组，不能是 load-balance：部分手机端内核对
-  // 「select 组里嵌 load-balance」支持不全，那个成员一失效整组就哑了，
-  // 表现正是「手机端 YouTube 一直转圈、电脑上却正常」。
-  t("流媒体默认出口是 url-test 组，不嵌 load-balance",
-    stream.includes("      - 🎬 流媒体自动") &&
-    stream.indexOf("- 🎬 流媒体自动") < stream.indexOf("- ⚡ 聚合"));
+  // 默认出口不能是 load-balance：部分手机端内核对「select 组里嵌
+  // load-balance」支持不全，那个成员一失效整组就哑了，表现正是
+  // 「手机端 YouTube 一直转圈、电脑上却正常」。
+  // 现在的默认是 🛟 流媒体兜底（fallback），它自己也不再嵌 load-balance，
+  // 整条默认链的这一条不变量在下面「兜底链不含 load-balance 组」守。
+  t("流媒体默认出口是兜底链，不嵌 load-balance",
+    stream.includes("      - 🛟 流媒体兜底") &&
+    stream.indexOf("- 🛟 流媒体兜底") < stream.indexOf("- ⚡ 聚合"));
   // CF 的出口 IP 被 Google 判成机房限流时，得能在流媒体组里直接换出口
   t("流媒体含能换出口的落地组",
     stream.includes("      - 🌐 落地出口") &&
@@ -703,8 +707,11 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
     // 多节点同时抖动会让整组「看着全死」—— 那正是用户抱怨过的现象
     t("♻️ 自动选择 max-failed-times 是 2（不是 1）", /max-failed-times: 2/.test(auto));
 
-    t("🎬 流媒体自动 收紧到 90s / 10ms",
-      /interval: 90/.test(stream) && /tolerance: 10/.test(stream));
+    // 这一组后来**故意改慢了**：视频是一条长连接，换出口会作废
+    // googlevideo 里已按 IP 签名的分片地址。所以它要「粘」，只在探测
+    // 判定不合格时才换。下面是完整的不变量断言（探测点档位一起守）。
+    t("🎬 流媒体自动 粘性 300s / 150ms（不是 90s / 10ms）",
+      /interval: 300/.test(stream) && /tolerance: 150/.test(stream));
     t("ZT团队边缘 收紧到 90s / 15ms",
       /interval: 90/.test(zg) && /tolerance: 15/.test(zg));
     t("ZT团队边缘 也开机即测", /lazy: false/.test(zg));
@@ -808,6 +815,143 @@ t(`无悬空引用${dangling.length ? " (" + dangling.slice(0, 3) + ")" : ""}`, 
   t("自动选择池子里确实有 W+ 节点（前缀不影响按端口过滤）",
     pool(plus.yaml).includes("W+ 198.1-443"));
 }
+
+  // ---- 探测点分层 + 「一个服务族同出口」不变量 ----
+  //
+  // 这一块守的是「本来能用、过几天就不能用」那类故障，两条核心不变量：
+  //
+  //   1. 流媒体族不能再用「不带 expected-status 的宽松探测点」。
+  //      内核判定「活不活」是 resp != nil && (expectedStatus == nil ||
+  //      expectedStatus.Check(code))（adapter/adapter.go），也就是说不写
+  //      expected-status 时**任何 HTTP 响应都算活**，403/429/302 都算。
+  //      于是出口被目标站拉黑了，gstatic 照样回 204，整组全绿，
+  //      自动选择**永远不换手** —— 用户看到的就是「一直不恢复」。
+  //
+  //   2. 一个服务的所有主机必须落在同一个组里。视频站的播放清单来自一个
+  //      域名、视频分片来自另一个；两个域名走了不同出口，分片就会被判 403
+  //      （googlevideo 的地址按请求方 IP 签名）。表现是「页面能开、
+  //      视频一直转圈」，而且时好时坏。
+  {
+    const proton2 = {
+      privateKey: "PKP", expiresAt: Math.floor(Date.now() / 1000) + 604800,
+      servers: [{ name: "日本1", cc: "JP", ip: "1.1.1.1", port: 51820, pub: "A" }],
+    };
+    const wind2 = {
+      username: "WU", password: "WP",
+      servers: [{ tag: "香港1", loc: "香港", host: "hk-016.totallyacdn.com", port: 443 }],
+    };
+    const zt2 = { ...warp, zeroTrust: true, deviceId: "zt-probe" };
+    const y = buildConfig(warp, opera, proton2, wind2, zt2).yaml;
+    const grpDef = (name) => {
+      const i = y.indexOf(`  - name: ${name}\n`);
+      return i < 0 ? "" : y.slice(i, y.indexOf("\n  - name:", i + 10));
+    };
+
+    // (1) 测试地址全部 HTTPS。上游在 URLTest 里自己 warn 过：HTTP 测试
+    //     地址可能被劫持，而且不兼容 unified-delay 的「重复 HEAD」计时。
+    const urls = [...y.matchAll(/^    url: (\S+)$/gm)].map((m) => m[1]);
+    t(`测试地址 ${urls.length} 个且全部 HTTPS`,
+      urls.length >= 10 && urls.every((u) => u.startsWith("https://")));
+
+    // (2) 严格档：出口本身就是卖点的组，必须带 expected-status。
+    //     GroupCommonOption.ExpectedStatus 的 Go 类型是 string，所以值必须
+    //     **带引号** —— 不去赌解码器能把整数 204 弱转成字符串，
+    //     赌输的代价是整份配置加载不了。
+    for (const n of ["🎬 流媒体自动", "Proton-自动", "WS-自动"]) {
+      const b = grpDef(n);
+      t(`${n} 用严格探测点 + expected-status "204"`,
+        b.includes("url: https://www.google.com/generate_204") &&
+        b.includes('expected-status: "204"'));
+    }
+    // 宽松档不能被误加严格判定：误判会让整组掉到成员列表的第一个上，
+    // 那比「慢」严重得多。
+    for (const n of ["♻️ 自动选择", "WARP直连", "ZT团队边缘"]) {
+      const b = grpDef(n);
+      t(`${n} 保持宽松探测（不写 expected-status）`,
+        b.length > 0 && !b.includes("expected-status"));
+    }
+
+    // (3) 流媒体族要「粘」；对照组是网页族，快切没有副作用。
+    const st = grpDef("🎬 流媒体自动");
+    const au = grpDef("♻️ 自动选择");
+    t("🎬 流媒体自动 粘性 interval 300", /interval: 300/.test(st));
+    t("🎬 流媒体自动 粘性 tolerance 150（值越大越不愿意换）",
+      /tolerance: 150/.test(st));
+    t("♻️ 自动选择 仍是快切 60/10（短连接，无副作用）",
+      /interval: 60/.test(au) && /tolerance: 10/.test(au));
+
+    // (4) 服务族同出口。直接在 rules 列表上做匹配，不看注释文字 ——
+    //     这几个域名全部由内联规则命中，且内联规则排在 RULE-SET 前面。
+    const rules = [...y.matchAll(/^  - (DOMAIN[^,]*,[^\n]+)$/gm)].map((m) => m[1]);
+    const routeOf = (domain) => {
+      const d = domain.toLowerCase();
+      for (const line of rules) {
+        const [typ, val, target] = line.split(",");
+        const v = String(val).toLowerCase();
+        if (typ === "DOMAIN-SUFFIX" && (d === v || d.endsWith("." + v))) return target;
+        if (typ === "DOMAIN" && d === v) return target;
+      }
+      return "(未命中)";
+    };
+
+    const ytHosts = ["www.youtube.com", "m.youtube.com", "youtu.be", "yt.be",
+                     "youtubei.googleapis.com", "www.youtube-nocookie.com",
+                     "rr3---sn-abc.googlevideo.com", "i.ytimg.com", "yt3.ggpht.com"];
+    const ytTargets = [...new Set(ytHosts.map(routeOf))];
+    t(`YouTube 全套 ${ytHosts.length} 个主机命中同一个组 ${ytTargets.join("/")}`,
+      ytTargets.length === 1 && ytTargets[0] === "🎬 流媒体");
+    // 回归：ggpht.com 曾在 PLAY_DOMAINS 里，规则发得更早，
+    // 于是把 yt3.ggpht.com 从 YouTube 族里拆了出去。
+    t("yt3.ggpht.com 不再漂到 🌐 落地出口", routeOf("yt3.ggpht.com") !== "🌐 落地出口");
+
+    for (const [label, hosts] of [
+      ["Netflix", ["www.netflix.com", "occ-1.nflxvideo.net", "ipv4-c1.nflximg.net", "assets.nflxext.com"]],
+      ["Disney+", ["www.disneyplus.com", "x.dssott.com", "bamgrid.com", "cdn.disneystreaming.com"]],
+      ["Prime", ["www.primevideo.com", "d1.aiv-cdn.net", "amazonvideo.com"]],
+      ["Spotify", ["open.spotify.com", "i.scdn.co", "audio.spotifycdn.com", "cdn.spotifycdn.net"]],
+      ["TikTok", ["www.tiktok.com", "api.tiktokv.com", "v16.tiktokcdn.com", "byteoversea.com"]],
+    ]) {
+      const ts = [...new Set(hosts.map(routeOf))];
+      t(`${label} 整族同出口 ${ts.join("/")}`,
+        ts.length === 1 && ts[0] !== "(未命中)");
+    }
+
+    // (5) 流媒体主机显式钉境外 DNS。原来只靠 geosite:geolocation-!cn，
+    //     那条策略依赖地理库；地理库没下载成功时**静默失效**，
+    //     直接回落国内 DoH —— 又是一类「先能用、过几天不能用」。
+    for (const d of ["youtube.com", "googlevideo.com", "youtubei.googleapis.com",
+                     "youtube-nocookie.com", "netflix.com", "spotifycdn.com",
+                     "disneyplus.com", "tiktokcdn.com"]) {
+      t(`DNS 显式钉境外 +.${d}`, y.includes(`'+.${d}':`));
+    }
+
+    // (6) 自动降级链。前面 (1)-(3) 解决的是「探测得准不准」，
+    //     这一条解决的是「探准了也逃不出去」：
+    //     🎬 流媒体自动 的池子全是 CF 共享出口。整族一起被目标站拉黑时，
+    //     严格探测会把它们全标死，而 url-test 全员不合格时退回
+    //     proxies[0]（urltest.go 的 fast()）—— 那还是个 CF 出口，原地不动。
+    //     兜底链用 fallback 按顺序取第一个活的，于是能一路降到
+    //     🌐 落地出口，整批换掉出口 IP。
+    const fb = grpDef("🛟 流媒体兜底");
+    t("🛟 流媒体兜底 存在且是 fallback",
+      /type: fallback/.test(fb));
+    t("兜底链第一层是流媒体自动组（CF 三族，最快）",
+      fb.includes("      - 🎬 流媒体自动"));
+    t("兜底链第二层换到别的出口族（🌐 落地出口）",
+      fb.includes("      - 🌐 落地出口"));
+    t("兜底链用严格探测 + expected-status",
+      fb.includes("url: https://www.google.com/generate_204") &&
+      fb.includes('expected-status: "204"'));
+    t("兜底链内含 DIRECT 作最后手段", /^      - DIRECT$/m.test(fb));
+    // 手机端兼容性：整条默认链上都不能出现 load-balance
+    t("兜底链不含 load-balance 组（手机端内核支持不全）",
+      !fb.includes("⚡ 聚合"));
+    const sm = grpDef("🎬 流媒体");
+    t("🎬 流媒体 的首个成员就是兜底链（= 默认走它）",
+      /^    proxies:\n      - 🛟 流媒体兜底$/m.test(sm));
+    t("手选通道还在（流媒体组仍留着逐个节点）",
+      sm.includes("      - 🌐 落地出口") && sm.includes('      - "'));
+  }
 
 console.log(`\n通过 ${pass} 失败 ${fail}`);
 if (fail) process.exit(1);
